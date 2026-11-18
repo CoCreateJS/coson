@@ -83,10 +83,27 @@ test("typed arrays can view the original encoded buffer", () => {
     assert.equal(restored.body.byteLength, 1024 * 1024);
 });
 
+test("supports binary views and inspection without reconstruction", () => {
+    const view = new DataView(Uint8Array.from([1, 2, 3, 4]).buffer, 1, 2);
+    const restoredView = decode(encode(view));
+    assert.ok(restoredView instanceof DataView);
+    assert.deepEqual(new Uint8Array(restoredView.buffer, restoredView.byteOffset, restoredView.byteLength), new Uint8Array([2, 3]));
+
+    if (typeof Buffer !== "undefined") {
+        const buffer = Buffer.from([5, 6, 7]);
+        assert.ok(Buffer.isBuffer(decode(encode(buffer))));
+        assert.deepEqual(decode(encode(buffer)), buffer);
+    }
+
+    const payload = encode({ value: undefined, date: new Date(1234) });
+    const inspected = decode(payload, { reconstruct: false });
+    assert.deepEqual(inspected.value, "$undefined");
+    assert.deepEqual(inspected.date, { $date: 1234 });
+});
+
 test("rejects malformed frames and unsupported input", () => {
-    assert.throws(() => decode(new Uint8Array([1, 2, 3])), /SplitBinary/);
+    assert.throws(() => decode(new Uint8Array([1, 2, 3])), /COSON/);
     assert.throws(() => decode(Uint8Array.from([...encode(null), 0])), /Trailing/);
-    assert.throws(() => encode(new DataView(new ArrayBuffer(3))), /Unsupported/);
     const circular = {};
     circular.self = circular;
     assert.throws(() => encode(circular), /Circular and shared/);

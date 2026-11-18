@@ -1,329 +1,1214 @@
-/**
- * COSON: portable structured serialization with raw binary sections.
- *
- * Structured values use the collision-safe Inline Hybrid operator encoding.
- * Binary values are stored as raw, length-prefixed sections in the same frame.
- */
+
+const MAGIC = [0x53, 0x42, 0x43, 3];
+const OPERATORS = 1;
+const INDEX = 2;
+const MAX_DEPTH = 512;
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const BufferType = globalThis.Buffer;
 
-const ARGUMENTLESS = new Set(["$undefined", "$nan", "$infinity", "$negativeInfinity"]);
-const OPERATOR_KEYS = new Set([...ARGUMENTLESS, "$number", "$date", "$bigint", "$map", "$set", "$regexp", "$string", "$literal"]);
+const types = [
+    ArrayBuffer,
+    Int8Array,
+    Uint8Array,
+    Uint8ClampedArray,
+    Int16Array,
+    Uint16Array,
+    Int32Array,
+    Uint32Array,
+    Float32Array,
+    Float64Array,
+    globalThis.BigInt64Array,
+    globalThis.BigUint64Array,
+    DataView,
+    globalThis.Float16Array,
+    BufferType
+];
 
-function operator(name, argument, hybrid) {
-	if (hybrid && ARGUMENTLESS.has(name)) return name;
-	if (ARGUMENTLESS.has(name)) return { [name]: true };
-	return { [name]: argument };
+const operators = new Set([
+    "$number",
+    "$bigint",
+    "$date",
+    "$regexp",
+    "$map",
+    "$set",
+    "$binary",
+    "$string",
+    "$literal"
+]);
+
+const own = (object, key) =>
+    Object.prototype.hasOwnProperty.call(object, key);
+
+const fail = message => {
+    throw new TypeError(`COSON: ${message}`);
+};
+
+const special = value =>
+    typeof value === "string" &&
+    value.length <= 17 &&
+    (
+        value === "$undefined" ||
+        value === "$nan" ||
+        value === "$infinity" ||
+        value === "$negativeInfinity"
+    );
+
+const define = (object, key, value) =>
+    Object.defineProperty(object, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true
+    });
+
+function mark(state, key, value) {
+    state.flags |= OPERATORS;
+    return { [key]: value };
 }
 
-function isOperatorObject(value) {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const keys = Object.keys(value);
-	return keys.length === 1 && OPERATOR_KEYS.has(keys[0]);
+function token(state, value) {
+    state.flags |= OPERATORS;
+    return value;
 }
 
-function transform(value, hybrid) {
-	const active = new WeakSet();
-	function visit(current) {
-		if (current === undefined) return operator("$undefined", true, hybrid);
-		if (typeof current === "number") {
-			if (Number.isNaN(current)) return operator("$nan", true, hybrid);
-			if (current === Infinity) return operator("$infinity", true, hybrid);
-			if (current === -Infinity) return operator("$negativeInfinity", true, hybrid);
-			if (Object.is(current, -0)) return operator("$number", "-0", hybrid);
-			return current;
-		}
-		if (typeof current === "string") return ARGUMENTLESS.has(current) ? { $string: current } : current;
-		if (current === null || typeof current === "boolean") return current;
-		if (typeof current === "bigint") return operator("$bigint", current.toString(10), hybrid);
-		if (current instanceof Date) return operator("$date", Number.isNaN(current.getTime()) ? null : current.getTime(), hybrid);
-		if (current instanceof RegExp) return operator("$regexp", [current.source, current.flags, current.lastIndex], hybrid);
-		if (!current || typeof current !== "object") throw new TypeError(`Unsupported value type: ${typeof current}`);
-		if (active.has(current)) throw new TypeError("Circular references are not supported");
-		active.add(current);
-		try {
-			if (current instanceof Map) return operator("$map", [...current].map(([key, item]) => [visit(key), visit(item)]), hybrid);
-			if (current instanceof Set) return operator("$set", [...current].map(visit), hybrid);
-			if (Array.isArray(current)) {
-				for (let i = 0; i < current.length; i++) if (!Object.hasOwn(current, i)) throw new TypeError("Sparse arrays are unsupported");
-				return current.map(visit);
-			}
-			const prototype = Object.getPrototypeOf(current);
-			if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`Unsupported value type: ${current.constructor?.name ?? "unknown"}`);
-			if (Object.getOwnPropertySymbols(current).some((key) => Object.getOwnPropertyDescriptor(current, key).enumerable)) throw new TypeError("Enumerable symbol keys are unsupported");
-			const entries = [];
-			for (const key of Object.keys(current)) {
-				const descriptor = Object.getOwnPropertyDescriptor(current, key);
-				if (descriptor.get || descriptor.set) throw new TypeError("Accessor properties are unsupported");
-				entries.push([key, visit(current[key])]);
-			}
-			const result = Object.fromEntries(entries);
-			// Escape objects that could be mistaken for operator values. The reserved
-			// literal wrapper is decoded as key/value pairs, so nested values still resolve.
-			return isOperatorObject(result) ? { $literal: entries } : result;
-		} finally {
-			active.delete(current);
-		}
-	}
-	return visit(value);
+function descriptor(object, key) {
+    const property = Object.getOwnPropertyDescriptor(object, key);
+
+    if (!property || !own(property, "value"))
+        fail("accessors and sparse arrays are unsupported");
+
+    return property.value;
 }
 
-function reconstruct(value) {
-	function visit(current) {
-		if (typeof current === "string") {
-			if (current === "$undefined") return undefined;
-			if (current === "$nan") return NaN;
-			if (current === "$infinity") return Infinity;
-			if (current === "$negativeInfinity") return -Infinity;
-			return current;
-		}
-		if (!current || typeof current !== "object") return current;
-		if (Array.isArray(current)) return current.map(visit);
-		if (!isOperatorObject(current)) {
-			const result = Object.create(Object.getPrototypeOf(current) === null ? null : Object.prototype);
-			for (const key of Object.keys(current)) Object.defineProperty(result, key, { value: visit(current[key]), enumerable: true, configurable: true, writable: true });
-			return result;
-		}
-		const [name] = Object.keys(current);
-		const argument = current[name];
-		switch (name) {
-			case "$undefined": return undefined;
-			case "$nan": return NaN;
-			case "$infinity": return Infinity;
-			case "$negativeInfinity": return -Infinity;
-			case "$number": return Number(argument);
-			case "$string": return argument;
-			case "$date": return argument === null ? new Date(NaN) : new Date(argument);
-			case "$bigint": return BigInt(argument);
-			case "$map": return new Map(argument.map(([key, item]) => [visit(key), visit(item)]));
-			case "$set": return new Set(argument.map(visit));
-			case "$regexp": { const regexp = new RegExp(argument[0], argument[1]); regexp.lastIndex = argument[2]; return regexp; }
-			case "$literal": {
-				const result = {};
-				for (const [key, item] of argument) Object.defineProperty(result, key, { value: visit(item), enumerable: true, configurable: true, writable: true });
-				return result;
-			}
-			default: throw new TypeError(`Unknown inline operator ${name}`);
-		}
-	}
-	return visit(value);
+function symbols(value) {
+    for (const key of Object.getOwnPropertySymbols(value)) {
+        if (Object.prototype.propertyIsEnumerable.call(value, key))
+            fail("enumerable symbol key");
+    }
 }
 
-function makeCodec(hybrid) {
-	return {
-		encode(value) { return encoder.encode(JSON.stringify(transform(value, hybrid))); },
-		decode(bytes) {
-			if (bytes instanceof ArrayBuffer) bytes = new Uint8Array(bytes);
-			if (!(bytes instanceof Uint8Array)) throw new TypeError("decode expects Uint8Array or ArrayBuffer");
-			return reconstruct(JSON.parse(decoder.decode(bytes)));
-		},
-	};
+function binary(value, state, type) {
+    const bytes = type === 0
+        ? new Uint8Array(value)
+        : new Uint8Array(
+            value.buffer,
+            value.byteOffset,
+            value.byteLength
+        );
+
+    if (
+        typeof SharedArrayBuffer !== "undefined" &&
+        bytes.buffer instanceof SharedArrayBuffer
+    ) {
+        fail("shared buffers are unsupported");
+    }
+
+    const index = state.sections.length;
+
+    state.sections.push({
+        bytes,
+        alignment: types[type].BYTES_PER_ELEMENT || 1
+    });
+
+    return mark(state, "$binary", [index, type]);
 }
 
-const inlineHybrid = makeCodec(true);
+function transform(value, state, depth = 0) {
+    if (depth > MAX_DEPTH)
+        fail("maximum depth exceeded");
 
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
-const MAGIC_JSON = [0x53, 0x42, 0x4a, 1]; // SBJ, version 1
-const MAGIC_V8 = [0x53, 0x42, 0x56, 1]; // SBV, version 1
+    if (value === null)
+        return null;
 
-const typedArrays = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
-if (typeof BigInt64Array !== "undefined") typedArrays.push(BigInt64Array, BigUint64Array);
+    switch (typeof value) {
+        case "string":
+            return special(value)
+                ? mark(state, "$string", value)
+                : value;
 
-function varuintSize(value) {
-	let bytes = 1;
-	while (value >= 128) { value = Math.floor(value / 128); bytes++; }
-	return bytes;
+        case "boolean":
+            return value;
+
+        case "undefined":
+            return token(state, "$undefined");
+
+        case "number":
+            if (Number.isNaN(value))
+                return token(state, "$nan");
+
+            if (value === Infinity)
+                return token(state, "$infinity");
+
+            if (value === -Infinity)
+                return token(state, "$negativeInfinity");
+
+            return Object.is(value, -0)
+                ? mark(state, "$number", "-0")
+                : value;
+
+        case "bigint":
+            return mark(state, "$bigint", value.toString());
+
+        case "object":
+            break;
+
+        default:
+            fail("unsupported value type");
+    }
+
+    if (state.seen.has(value))
+        fail("circular or shared reference");
+
+    state.seen.add(value);
+
+    symbols(value);
+
+    const prototype = Object.getPrototypeOf(value);
+
+    if (prototype === ArrayBuffer.prototype)
+        return binary(value, state, 0);
+
+    if (ArrayBuffer.isView(value)) {
+        for (let i = 1; i < types.length; i++) {
+            if (types[i] && prototype === types[i].prototype)
+                return binary(value, state, i);
+        }
+
+        fail("unsupported binary type");
+    }
+
+    if (prototype === Date.prototype) {
+        return mark(
+            state,
+            "$date",
+            Number.isNaN(value.getTime())
+                ? null
+                : value.getTime()
+        );
+    }
+
+    if (prototype === RegExp.prototype) {
+        return mark(state, "$regexp", [
+            value.source,
+            value.flags,
+            transform(value.lastIndex, state, depth + 1)
+        ]);
+    }
+
+    if (prototype === Map.prototype) {
+        const entries = [];
+
+        for (const [key, item] of value) {
+            entries.push([
+                transform(key, state, depth + 1),
+                transform(item, state, depth + 1)
+            ]);
+        }
+
+        return mark(state, "$map", entries);
+    }
+
+    if (prototype === Set.prototype) {
+        const entries = [];
+
+        for (const item of value)
+            entries.push(transform(item, state, depth + 1));
+
+        return mark(state, "$set", entries);
+    }
+
+    const keys = Object.keys(value);
+
+    if (own(value, "toJSON")) {
+        const hook = descriptor(value, "toJSON");
+
+        if (typeof hook === "function")
+            fail("custom toJSON is unsupported");
+    }
+
+    if (Array.isArray(value)) {
+        if (
+            prototype !== Array.prototype ||
+            keys.length !== value.length ||
+            "toJSON" in Array.prototype
+        ) {
+            fail("unsupported array shape");
+        }
+
+        let result;
+
+        for (let i = 0; i < value.length; i++) {
+            if (keys[i] !== String(i))
+                fail("sparse array or extra array property");
+
+            const original = descriptor(value, i);
+            const item = transform(original, state, depth + 1);
+
+            if (!result && !Object.is(original, item)) {
+                result = new Array(value.length);
+
+                for (let j = 0; j < i; j++)
+                    result[j] = value[j];
+            }
+
+            if (result)
+                result[i] = item;
+        }
+
+        return result || value;
+    }
+
+    if (
+        prototype !== Object.prototype &&
+        prototype !== null
+    ) {
+        fail("unsupported prototype");
+    }
+
+    if (
+        prototype === Object.prototype &&
+        "toJSON" in Object.prototype
+    ) {
+        fail("inherited toJSON");
+    }
+
+    const literal =
+        keys.length === 1 &&
+        operators.has(keys[0]);
+
+    let result;
+
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        const original = descriptor(value, key);
+        const item = transform(original, state, depth + 1);
+
+        if (literal)
+            return mark(state, "$literal", [[key, item]]);
+
+        if (!result && !Object.is(original, item)) {
+            result = Object.create(null);
+
+            for (let j = 0; j < i; j++)
+                result[keys[j]] = value[keys[j]];
+        }
+
+        if (result)
+            result[key] = item;
+    }
+
+    return result || value;
 }
 
-class Writer {
-	constructor(bytes) { this.bytes = bytes; this.offset = 0; }
-	byte(value) { this.bytes[this.offset++] = value; }
-	varuint(value) {
-		while (value >= 128) { this.byte((value % 128) | 128); value = Math.floor(value / 128); }
-		this.byte(value);
-	}
-	data(value) { this.bytes.set(value, this.offset); this.offset += value.byteLength; }
+/*
+ * Identify reconstruction operators.
+ */
+
+function operator(value) {
+    if (special(value))
+        return value;
+
+    if (
+        !value ||
+        typeof value !== "object" ||
+        Array.isArray(value)
+    ) {
+        return null;
+    }
+
+    const keys = Object.keys(value);
+
+    return keys.length === 1 && operators.has(keys[0])
+        ? keys[0]
+        : null;
 }
 
-class Reader {
-	constructor(bytes) {
-		if (bytes instanceof ArrayBuffer) bytes = new Uint8Array(bytes);
-		if (!(bytes instanceof Uint8Array)) throw new TypeError("decode expects Uint8Array or ArrayBuffer");
-		this.bytes = bytes;
-		this.offset = 0;
-	}
-	need(length) { if (!Number.isSafeInteger(length) || length < 0 || this.offset + length > this.bytes.length) throw new RangeError("Unexpected end of SplitBinary payload"); }
-	byte() { this.need(1); return this.bytes[this.offset++]; }
-	varuint() {
-		let value = 0, multiplier = 1;
-		for (let i = 0; i < 8; i++) {
-			const byte = this.byte();
-			value += (byte & 127) * multiplier;
-			if (!Number.isSafeInteger(value)) throw new RangeError("SplitBinary length exceeds supported range");
-			if (!(byte & 128)) return value;
-			multiplier *= 128;
-		}
-		throw new TypeError("Invalid SplitBinary length encoding");
-	}
-	data(length) { this.need(length); const result = this.bytes.subarray(this.offset, this.offset + length); this.offset += length; return result; }
+/*
+ * Generate reconstruction paths on the sender.
+ *
+ * Full reconstruction indexes outermost operators.
+ * Binary reconstruction indexes every binary reference,
+ * including those nested inside other operators.
+ */
+
+function collectIndex(value) {
+    const full = [];
+    const binary = [];
+    const path = [];
+
+    function visit(value, covered = false) {
+        const key = operator(value);
+
+        if (key && !covered)
+            full.push([path.slice(), key]);
+
+        if (key === "$binary") {
+            binary.push([path.slice(), key]);
+            return;
+        }
+
+        if (key) {
+            const argument = value[key];
+
+            if (
+                key === "$map" ||
+                key === "$set" ||
+                key === "$regexp" ||
+                key === "$literal"
+            ) {
+                path.push(key);
+
+                if (key === "$map") {
+                    for (let i = 0; i < argument.length; i++) {
+                        path.push(i, 0);
+                        visit(argument[i][0], true);
+                        path.pop();
+
+                        path.push(1);
+                        visit(argument[i][1], true);
+                        path.pop();
+                        path.pop();
+                    }
+                } else if (key === "$set") {
+                    for (let i = 0; i < argument.length; i++) {
+                        path.push(i);
+                        visit(argument[i], true);
+                        path.pop();
+                    }
+                } else if (key === "$regexp") {
+                    path.push(2);
+                    visit(argument[2], true);
+                    path.pop();
+                } else {
+                    path.push(0, 1);
+                    visit(argument[0][1], true);
+                    path.pop();
+                    path.pop();
+                }
+
+                path.pop();
+            }
+
+            return;
+        }
+
+        if (!value || typeof value !== "object")
+            return;
+
+        if (Array.isArray(value)) {
+            for (let i = 0; i < value.length; i++) {
+                path.push(i);
+                visit(value[i], covered);
+                path.pop();
+            }
+        } else {
+            for (const key of Object.keys(value)) {
+                path.push(key);
+                visit(value[key], covered);
+                path.pop();
+            }
+        }
+    }
+
+    visit(value);
+
+    return [full, binary];
 }
 
-function numberNode(value) {
-	if (Number.isNaN(value)) return ["number", "nan"];
-	if (value === Infinity) return ["number", "+infinity"];
-	if (value === -Infinity) return ["number", "-infinity"];
-	if (Object.is(value, -0)) return ["number", "-0"];
-	return ["number", value];
+function varSize(value) {
+    let size = 1;
+
+    while (value >= 128) {
+        value = Math.floor(value / 128);
+        size++;
+    }
+
+    return size;
 }
 
-function makeSkeleton(value, sections, seen) {
-	if (value === null) return ["null"];
-	if (value === undefined) return ["undefined"];
-	if (typeof value === "boolean") return ["boolean", value];
-	if (typeof value === "number") return numberNode(value);
-	if (typeof value === "string") return ["string", value];
-	if (typeof value === "bigint") return ["bigint", value.toString()];
-	if (typeof value !== "object") throw new TypeError(`Unsupported SplitBinary value: ${typeof value}`);
-	if (seen.has(value)) throw new TypeError("Circular and shared object references are not supported");
-	seen.add(value);
-	if (value instanceof Date) return ["date", numberNode(value.getTime())];
-	if (value instanceof RegExp) return ["regexp", value.source, value.flags, value.lastIndex];
-	if (value instanceof ArrayBuffer) {
-		const index = sections.push({ bytes: new Uint8Array(value), type: -1 }) - 1;
-		return ["binary", index, -1];
-	}
-	if (ArrayBuffer.isView(value)) {
-		const type = typedArrays.indexOf(value.constructor);
-		if (type < 0 || value instanceof DataView) throw new TypeError(`Unsupported SplitBinary binary view: ${value.constructor.name}`);
-		const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-		const index = sections.push({ bytes, type }) - 1;
-		return ["binary", index, type];
-	}
-	if (Array.isArray(value)) {
-		for (let i = 0; i < value.length; i++) if (!Object.hasOwn(value, i)) throw new TypeError("Sparse arrays are not supported");
-		return ["array", value.map((item) => makeSkeleton(item, sections, seen))];
-	}
-	if (value instanceof Map) {
-		const entries = [];
-		for (const [key, item] of value) entries.push([makeSkeleton(key, sections, seen), makeSkeleton(item, sections, seen)]);
-		return ["map", entries];
-	}
-	if (value instanceof Set) return ["set", [...value].map((item) => makeSkeleton(item, sections, seen))];
-	const prototype = Object.getPrototypeOf(value);
-	if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`Unsupported SplitBinary object: ${value.constructor?.name ?? "unknown"}`);
-	if (Object.getOwnPropertySymbols(value).some((symbol) => Object.getOwnPropertyDescriptor(value, symbol).enumerable)) throw new TypeError("Enumerable symbol keys are not supported");
-	const entries = [];
-	for (const key of Object.keys(value)) {
-		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (descriptor.get || descriptor.set) throw new TypeError("Accessor properties are not supported");
-		entries.push([key, makeSkeleton(value[key], sections, seen)]);
-	}
-	return ["object", entries];
+function writeVar(output, offset, value) {
+    while (value >= 128) {
+        output[offset++] = (value % 128) | 128;
+        value = Math.floor(value / 128);
+    }
+
+    output[offset++] = value;
+
+    return offset;
 }
 
-function restoreNumber(node) {
-	if (node[1] === "nan") return NaN;
-	if (node[1] === "+infinity") return Infinity;
-	if (node[1] === "-infinity") return -Infinity;
-	if (node[1] === "-0") return -0;
-	return node[1];
+/*
+ * Encode
+ */
+
+export function encode(value, options) {
+    const state = {
+        flags: 0,
+        sections: [],
+        seen: new WeakSet()
+    };
+
+    const transformed = transform(value, state);
+
+    const index =
+        state.flags && options?.index !== false
+            ? encoder.encode(
+                JSON.stringify(collectIndex(transformed))
+            )
+            : null;
+
+    if (index)
+        state.flags |= INDEX;
+
+    const json = JSON.stringify(transformed);
+
+    const structured = BufferType
+        ? null
+        : encoder.encode(json);
+
+    const length = structured
+        ? structured.length
+        : BufferType.byteLength(json, "utf8");
+
+    const sections = state.sections;
+
+    const start =
+        MAGIC.length +
+        1 +
+        varSize(length) +
+        varSize(sections.length);
+
+    let size =
+        start +
+        length +
+        (index ? varSize(index.length) + index.length : 0);
+
+    for (const section of sections) {
+        size += varSize(section.bytes.length) + 1;
+
+        section.padding =
+            (section.alignment - size % section.alignment) %
+            section.alignment;
+
+        size += section.padding + section.bytes.length;
+    }
+
+    const output = new Uint8Array(size);
+
+    output.set(MAGIC);
+
+    if (index)
+        output[3] = 4;
+
+    output[4] = state.flags;
+
+    let offset = writeVar(output, 5, length);
+
+    offset = writeVar(output, offset, sections.length);
+
+    if (index) {
+        offset = writeVar(output, offset, index.length);
+
+        output.set(index, offset);
+
+        offset += index.length;
+    }
+
+    if (structured) {
+        output.set(structured, offset);
+    } else {
+        const written = BufferType.from(
+            output.buffer,
+            output.byteOffset,
+            output.byteLength
+        ).write(json, offset, length, "utf8");
+
+        if (written !== length)
+            fail("UTF-8 length mismatch");
+    }
+
+    offset += length;
+
+    for (const section of sections) {
+        offset = writeVar(
+            output,
+            offset,
+            section.bytes.length
+        );
+
+        output[offset++] = section.padding;
+
+        offset += section.padding;
+
+        output.set(section.bytes, offset);
+
+        offset += section.bytes.length;
+    }
+
+    return output;
 }
 
-function restoreSkeleton(node, sections) {
-	if (!Array.isArray(node) || typeof node[0] !== "string") throw new TypeError("Invalid SplitBinary structured value");
-	switch (node[0]) {
-		case "null": return null;
-		case "undefined": return undefined;
-		case "boolean": return node[1];
-		case "number": return restoreNumber(node);
-		case "string": return node[1];
-		case "bigint": return BigInt(node[1]);
-		case "date": return new Date(restoreNumber(node[1]));
-		case "regexp": { const value = new RegExp(node[1], node[2]); value.lastIndex = node[3]; return value; }
-		case "array": return node[1].map((item) => restoreSkeleton(item, sections));
-		case "object": {
-			const value = {};
-			for (const [key, item] of node[1]) Object.defineProperty(value, key, { value: restoreSkeleton(item, sections), enumerable: true, configurable: true, writable: true });
-			return value;
-		}
-		case "map": return new Map(node[1].map(([key, item]) => [restoreSkeleton(key, sections), restoreSkeleton(item, sections)]));
-		case "set": return new Set(node[1].map((item) => restoreSkeleton(item, sections)));
-		case "binary": {
-			const [index, type] = node.slice(1);
-			const bytes = sections[index];
-			if (!bytes) throw new TypeError("SplitBinary reference is out of range");
-			if (type === -1) return bytes.slice().buffer;
-			const Type = typedArrays[type];
-			if (!Type || bytes.byteLength % Type.BYTES_PER_ELEMENT) throw new TypeError("Invalid SplitBinary typed array reference");
-			if (bytes.byteOffset % Type.BYTES_PER_ELEMENT === 0) return new Type(bytes.buffer, bytes.byteOffset, bytes.byteLength / Type.BYTES_PER_ELEMENT);
-			const copy = bytes.slice();
-			return new Type(copy.buffer, copy.byteOffset, copy.byteLength / Type.BYTES_PER_ELEMENT);
-		}
-		default: throw new TypeError(`Unknown SplitBinary structure tag: ${node[0]}`);
-	}
+/*
+ * Read and validate the envelope.
+ * Supports indexed and unindexed frames.
+ */
+
+function frame(input) {
+    if (!(input instanceof Uint8Array))
+        fail("expected Uint8Array");
+
+    const bytes = new Uint8Array(
+        input.buffer,
+        input.byteOffset,
+        input.byteLength
+    );
+
+    let offset = 0;
+
+    function byte() {
+        if (offset >= bytes.length)
+            fail("truncated frame");
+
+        return bytes[offset++];
+    }
+
+    function uint() {
+        let value = 0;
+        let factor = 1;
+
+        for (let i = 0; i < 8; i++) {
+            const part = byte();
+
+            value += (part & 127) * factor;
+
+            if (!Number.isSafeInteger(value))
+                fail("invalid integer");
+
+            if (part < 128) {
+                if (i && !part)
+                    fail("noncanonical integer");
+
+                return value;
+            }
+
+            factor *= 128;
+        }
+
+        fail("invalid integer");
+    }
+
+    function read(length) {
+        if (length > bytes.length - offset)
+            fail("truncated section");
+
+        const result = bytes.subarray(
+            offset,
+            offset + length
+        );
+
+        offset += length;
+
+        return result;
+    }
+
+    for (let i = 0; i < 3; i++) {
+        if (byte() !== MAGIC[i])
+            fail("unsupported frame magic");
+    }
+
+    const version = byte();
+
+    if (version !== 3 && version !== 4)
+        fail("unsupported frame version");
+
+    const flags = byte();
+
+    if (
+        (flags & ~(version === 4
+            ? OPERATORS | INDEX
+            : OPERATORS)) ||
+        ((flags & INDEX) && !(flags & OPERATORS))
+    ) {
+        fail("unknown flags");
+    }
+
+    const length = uint();
+    const count = uint();
+
+    const index = flags & INDEX
+        ? read(uint())
+        : null;
+
+    const structured = read(length);
+
+    if (
+        count > Math.floor((bytes.length - offset) / 2) ||
+        (count && !flags)
+    ) {
+        fail("invalid section count");
+    }
+
+    const sections = new Array(count);
+
+    for (let i = 0; i < count; i++) {
+        const length = uint();
+        const padding = byte();
+
+        if (padding > 7)
+            fail("invalid padding");
+
+        for (let j = 0; j < padding; j++) {
+            if (byte())
+                fail("nonzero padding");
+        }
+
+        sections[i] = read(length);
+    }
+
+    if (offset !== bytes.length)
+        fail("trailing bytes");
+
+    return {
+        flags,
+        structured,
+        sections,
+        index
+    };
 }
 
-function encodeFramed(value, serialize, magic) {
-	const sections = [];
-	const skeleton = makeSkeleton(value, sections, new WeakSet());
-	const structured = serialize(skeleton);
-	if (!(structured instanceof Uint8Array)) throw new TypeError("Structured serializer must return Uint8Array");
-	let total = magic.length + varuintSize(structured.byteLength) + varuintSize(sections.length) + structured.byteLength;
-	let cursor = total;
-	for (const section of sections) {
-		const alignment = section.type < 0 ? 1 : typedArrays[section.type].BYTES_PER_ELEMENT;
-		total += varuintSize(section.bytes.byteLength) + 1;
-		cursor += varuintSize(section.bytes.byteLength) + 1;
-		const padding = (alignment - (cursor % alignment)) % alignment;
-		total += padding + section.bytes.byteLength;
-		cursor += padding + section.bytes.byteLength;
-	}
-	const output = new Uint8Array(total);
-	const writer = new Writer(output);
-	for (const byte of magic) writer.byte(byte);
-	writer.varuint(structured.byteLength);
-	writer.varuint(sections.length);
-	writer.data(structured);
-	for (const section of sections) {
-		writer.varuint(section.bytes.byteLength);
-		const alignment = section.type < 0 ? 1 : typedArrays[section.type].BYTES_PER_ELEMENT;
-		const padding = (alignment - ((writer.offset + 1) % alignment)) % alignment;
-		writer.byte(padding);
-		for (let i = 0; i < padding; i++) writer.byte(0);
-		writer.data(section.bytes);
-	}
-	if (writer.offset !== output.byteLength) throw new Error("SplitBinary frame size calculation mismatch");
-	return output;
+/*
+ * Restore native binary values.
+ */
+
+function restoreBinary(argument, sections) {
+    if (
+        !Array.isArray(argument) ||
+        argument.length !== 2
+    ) {
+        fail("invalid binary operator");
+    }
+
+    const [index, type] = argument;
+
+    if (
+        !Number.isInteger(index) ||
+        index < 0 ||
+        index >= sections.length ||
+        !Number.isInteger(type) ||
+        !types[type]
+    ) {
+        fail("invalid binary reference");
+    }
+
+    const bytes = sections[index];
+    const Type = types[type];
+
+    if (type === 0)
+        return new Uint8Array(bytes).buffer;
+
+    if (type === 12) {
+        return new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength
+        );
+    }
+
+    if (type === 14) {
+        return BufferType.from(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength
+        );
+    }
+
+    const alignment = Type.BYTES_PER_ELEMENT;
+
+    if (bytes.byteLength % alignment)
+        fail("invalid binary length");
+
+    const view = bytes.byteOffset % alignment
+        ? new Uint8Array(bytes)
+        : bytes;
+
+    return new Type(
+        view.buffer,
+        view.byteOffset,
+        view.byteLength / alignment
+    );
 }
 
-function decodeFramed(bytes, deserialize, magic) {
-	const reader = new Reader(bytes);
-	for (const expected of magic) if (reader.byte() !== expected) throw new TypeError("Invalid SplitBinary format or version");
-	const structuredLength = reader.varuint();
-	const sectionCount = reader.varuint();
-	const structured = reader.data(structuredLength);
-	const skeleton = deserialize(structured);
-	const sections = new Array(sectionCount);
-	for (let index = 0; index < sectionCount; index++) {
-		const length = reader.varuint();
-		const padding = reader.byte();
-		reader.data(padding);
-		sections[index] = reader.data(length);
-	}
-	if (reader.offset !== reader.bytes.length) throw new TypeError("Trailing bytes after SplitBinary payload");
-	return restoreSkeleton(skeleton, sections);
+/*
+ * Recursive reconstruction.
+ *
+ * Used for unindexed frames and nested operator arguments.
+ */
+
+function reconstruct(value, sections, depth = 0) {
+    if (depth > MAX_DEPTH)
+        fail("maximum depth exceeded");
+
+    if (value === "$undefined")
+        return undefined;
+
+    if (value === "$nan")
+        return NaN;
+
+    if (value === "$infinity")
+        return Infinity;
+
+    if (value === "$negativeInfinity")
+        return -Infinity;
+
+    if (value === null || typeof value !== "object")
+        return value;
+
+    const next = item =>
+        reconstruct(item, sections, depth + 1);
+
+    if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++)
+            value[i] = next(value[i]);
+
+        return value;
+    }
+
+    const keys = Object.keys(value);
+
+    if (keys.length === 1 && operators.has(keys[0])) {
+        const argument = value[keys[0]];
+
+        switch (keys[0]) {
+            case "$string":
+                if (
+                    typeof argument !== "string" ||
+                    !special(argument)
+                ) {
+                    fail("invalid string escape");
+                }
+
+                return argument;
+
+            case "$number":
+                if (argument !== "-0")
+                    fail("invalid number");
+
+                return -0;
+
+            case "$bigint":
+                if (
+                    typeof argument !== "string" ||
+                    !/^-?(0|[1-9]\d*)$/.test(argument)
+                ) {
+                    fail("invalid bigint");
+                }
+
+                return BigInt(argument);
+
+            case "$date":
+                if (
+                    argument !== null &&
+                    !Number.isSafeInteger(argument)
+                ) {
+                    fail("invalid date");
+                }
+
+                return new Date(
+                    argument === null ? NaN : argument
+                );
+
+            case "$regexp": {
+                if (
+                    !Array.isArray(argument) ||
+                    argument.length !== 3 ||
+                    typeof argument[0] !== "string" ||
+                    typeof argument[1] !== "string"
+                ) {
+                    fail("invalid regexp");
+                }
+
+                const result = new RegExp(
+                    argument[0],
+                    argument[1]
+                );
+
+                result.lastIndex = next(argument[2]);
+
+                return result;
+            }
+
+            case "$binary":
+                return restoreBinary(argument, sections);
+
+            case "$map": {
+                if (!Array.isArray(argument))
+                    fail("invalid map");
+
+                const result = new Map();
+
+                for (const entry of argument) {
+                    if (
+                        !Array.isArray(entry) ||
+                        entry.length !== 2
+                    ) {
+                        fail("invalid map entry");
+                    }
+
+                    result.set(
+                        next(entry[0]),
+                        next(entry[1])
+                    );
+                }
+
+                return result;
+            }
+
+            case "$set": {
+                if (!Array.isArray(argument))
+                    fail("invalid set");
+
+                const result = new Set();
+
+                for (const item of argument)
+                    result.add(next(item));
+
+                return result;
+            }
+
+            case "$literal": {
+                if (
+                    !Array.isArray(argument) ||
+                    argument.length !== 1 ||
+                    !Array.isArray(argument[0]) ||
+                    argument[0].length !== 2 ||
+                    !operators.has(argument[0][0])
+                ) {
+                    fail("invalid literal");
+                }
+
+                const result = {};
+
+                define(
+                    result,
+                    argument[0][0],
+                    next(argument[0][1])
+                );
+
+                return result;
+            }
+        }
+    }
+
+    for (const key of keys)
+        value[key] = next(value[key]);
+
+    return value;
 }
 
+/*
+ * Indexed reconstruction.
+ *
+ * Accesses known paths without traversing unrelated properties.
+ */
 
-const MAGIC_COSON = [0x53, 0x42, 0x43, 1]; // SBC, version 1
+function applyIndex(value, entries, sections, binaryOnly) {
+    if (!Array.isArray(entries))
+        fail("invalid reconstruction index");
 
-/** Encode a supported JavaScript value as a Uint8Array. */
-export function encode(value) {
-	return encodeFramed(value, (skeleton) => inlineHybrid.encode(skeleton), MAGIC_COSON);
+    for (const entry of entries) {
+        if (
+            !Array.isArray(entry) ||
+            entry.length !== 2 ||
+            !Array.isArray(entry[0])
+        ) {
+            fail("invalid reconstruction entry");
+        }
+
+        const [path, key] = entry;
+
+        if (
+            path.length > MAX_DEPTH * 4 ||
+            (binaryOnly && key !== "$binary")
+        ) {
+            fail("invalid reconstruction path");
+        }
+
+        let parent;
+        let target = value;
+
+        for (const part of path) {
+            if (
+                !(
+                    typeof part === "string" ||
+                    (Number.isSafeInteger(part) && part >= 0)
+                ) ||
+                !target ||
+                typeof target !== "object" ||
+                !own(target, part)
+            ) {
+                fail("invalid reconstruction path");
+            }
+
+            parent = target;
+            target = target[part];
+        }
+
+        if (operator(target) !== key || !key)
+            fail("invalid indexed operator");
+
+        const restored = binaryOnly
+            ? restoreBinary(target.$binary, sections)
+            : reconstruct(target, sections);
+
+        if (path.length)
+            define(parent, path[path.length - 1], restored);
+        else
+            value = restored;
+    }
+
+    return value;
 }
 
-/** Decode a value previously encoded by encode(). */
-export function decode(bytes) {
-	return decodeFramed(bytes, (structured) => inlineHybrid.decode(structured), MAGIC_COSON);
+/*
+ * Prepare the non-reconstructed binary envelope.
+ *
+ * Converts encoded binary operators:
+ *
+ *     { $binary: [0, 2] }
+ *
+ * Into direct references:
+ *
+ *     "$binary[0]"
+ *
+ * And attaches the binary sections to the root:
+ *
+ *     $binary: [
+ *         { $Uint8Array: bytes }
+ *     ]
+ *
+ * The original message remains the root object.
+ * No native application values are reconstructed.
+ */
+
+function preserveBinary(value, sections) {
+    if (!sections.length)
+        return value;
+
+    if (
+        !value ||
+        typeof value !== "object" ||
+        Array.isArray(value) ||
+        operator(value)
+    ) {
+        fail("binary envelope must be an object");
+    }
+
+    if (own(value, "$binary"))
+        fail("binary envelope property conflict");
+
+    const entries = new Array(sections.length);
+    const visited = new Set();
+    let references = 0;
+
+    function visit(value, depth = 0) {
+        if (depth > MAX_DEPTH)
+            fail("maximum depth exceeded");
+
+        if (
+            !value ||
+            typeof value !== "object"
+        ) {
+            return value;
+        }
+
+        const key = operator(value);
+
+        if (key === "$binary") {
+            const argument = value.$binary;
+
+            if (
+                !Array.isArray(argument) ||
+                argument.length !== 2
+            ) {
+                fail("invalid binary operator");
+            }
+
+            const [index, type] = argument;
+
+            if (
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                index >= sections.length ||
+                !Number.isInteger(type) ||
+                !types[type]
+            ) {
+                fail("invalid binary reference");
+            }
+
+            const bytes = sections[index];
+            const Type = types[type];
+            const alignment = Type.BYTES_PER_ELEMENT || 1;
+
+            if (
+                type !== 0 &&
+                type !== 12 &&
+                bytes.byteLength % alignment
+            ) {
+                fail("invalid binary length");
+            }
+
+            if (!entries[index]) {
+                const name = type === 14
+                    ? "Buffer"
+                    : Type.name;
+
+                entries[index] = {
+                    [`$${name}`]: bytes
+                };
+            } else {
+                const name = Object.keys(entries[index])[0];
+                const expected = type === 14
+                    ? "$Buffer"
+                    : `$${Type.name}`;
+
+                if (name !== expected)
+                    fail("conflicting binary types");
+            }
+
+            visited.add(index);
+            references++;
+
+            return `$binary[${index}]`;
+        }
+
+        if (Array.isArray(value)) {
+            for (let i = 0; i < value.length; i++) {
+                const item = visit(
+                    value[i],
+                    depth + 1
+                );
+
+                if (!Object.is(item, value[i]))
+                    value[i] = item;
+            }
+
+            return value;
+        }
+
+        for (const key of Object.keys(value)) {
+            const original = value[key];
+            const item = visit(
+                original,
+                depth + 1
+            );
+
+            if (!Object.is(original, item))
+                define(value, key, item);
+        }
+
+        return value;
+    }
+
+    visit(value);
+
+    if (
+        !references ||
+        visited.size !== sections.length
+    ) {
+        fail("unreferenced binary section");
+    }
+
+    define(value, "$binary", entries);
+
+    return value;
+}
+
+/*
+ * Decode
+ *
+ * reconstruct: true
+ *     Restore native JavaScript values.
+ *
+ * reconstruct: "binary"
+ *     Restore binary values only.
+ *
+ * reconstruct: false
+ *     Preserve encoded operators.
+ *     Replace binary operators with path references.
+ *     Attach typed binary sections to root $binary.
+ */
+
+export function decode(bytes, options) {
+    const mode = options?.reconstruct ?? true;
+
+    if (
+        mode !== true &&
+        mode !== false &&
+        mode !== "binary"
+    ) {
+        fail("invalid reconstruction mode");
+    }
+
+    const {
+        flags,
+        structured,
+        sections,
+        index
+    } = frame(bytes);
+
+    const value = JSON.parse(
+        decoder.decode(structured)
+    );
+
+    // Preserve the encoded representation.
+
+    if (mode === false)
+        return preserveBinary(value, sections);
+
+    // Native JSON fast path.
+
+    if (!(flags & OPERATORS))
+        return value;
+
+    // Automatically use the reconstruction index.
+
+    if (index) {
+        const entries = JSON.parse(
+            decoder.decode(index)
+        );
+
+        if (
+            !Array.isArray(entries) ||
+            entries.length !== 2 ||
+            !entries.every(Array.isArray)
+        ) {
+            fail("invalid index");
+        }
+
+        return applyIndex(
+            value,
+            entries[mode === "binary" ? 1 : 0],
+            sections,
+            mode === "binary"
+        );
+    }
+
+    // Binary-only fallback for unindexed frames.
+
+    if (mode === "binary") {
+        return sections.length
+            ? applyIndex(
+                value,
+                collectIndex(value)[1],
+                sections,
+                true
+            )
+            : value;
+    }
+
+    // Full recursive reconstruction fallback.
+
+    return reconstruct(value, sections);
 }

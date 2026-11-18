@@ -97,3 +97,6 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+# Keep the benchmark-only dependency lockfile reproducible.
+!benchmarks/package-lock.json

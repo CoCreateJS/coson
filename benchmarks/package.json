@@ -1,0 +1,14 @@
+{
+  "name": "@cocreate/coson-benchmarks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "coson": "node --expose-gc --max-old-space-size=256 coson-only.js",
+    "compare": "node --expose-gc --max-old-space-size=256 coson-vs-competitors.js",
+    "decode-reconstruction": "node --expose-gc --max-old-space-size=256 decode-reconstruction.js"
+  },
+  "devDependencies": {
+    "bson": "^6.10.4",
+    "cbor-x": "^1.6.9"
+  }
+}
