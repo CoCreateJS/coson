@@ -1,5 +1,3 @@
-You're right. I changed the structure when you only wanted one additional bullet in the README you already liked. I've preserved that version below, with the new type-fidelity bullet inserted immediately after the 32% faster decoding result. Everything else remains unchanged.
-
 # CoSON
 
 ### CoCreate Object Serialization Notation
