@@ -1,0 +1,23 @@
+{
+  "name": "@cocreate/coson",
+  "version": "1.0.0",
+  "description": "Portable JavaScript serialization with lossless structured types and raw binary sections.",
+  "keywords": ["cocreate", "serialization", "binary", "structured-clone"],
+  "type": "module",
+  "main": "./src/index.js",
+  "browser": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["src/", "specifications/", "docs/", "README.md", "CHANGELOG.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test"
+  },
+  "publishConfig": { "access": "public" },
+  "license": "AGPL-3.0",
+  "repository": { "type": "git", "url": "git+https://github.com/CoCreateJS/coson.git" },
+  "author": "CoCreate LLC",
+  "bugs": { "url": "https://github.com/CoCreateJS/coson/issues" },
+  "homepage": "https://CoCreateJS.com/docs/coson"
+}
