@@ -440,7 +440,189 @@ function writeVar(output, offset, value) {
 }
 
 /*
+ * Binary references are reserved within a prepared binary envelope.
+ *
+ * Only visit application-value positions, not scalar operator arguments
+ * (for example, regexp source strings and literal property names).
+ *
+ * Copy on write: encoding never modifies the caller's object.
+ */
+
+function binaryReference(value) {
+    if (typeof value !== "string")
+        return null;
+
+    const match = /^\$binary\[(0|[1-9]\d*)\]$/.exec(value);
+
+    return match && match[0] === value
+        ? Number(match[1])
+        : null;
+}
+
+function mapBinaryValues(value, replace, depth = 0) {
+    if (depth > MAX_DEPTH)
+        fail("maximum depth exceeded");
+
+    const result = replace(value);
+
+    if (!Object.is(result, value))
+        return result;
+
+    if (!value || typeof value !== "object")
+        return value;
+
+    const key = operator(value);
+    const next = item => mapBinaryValues(item, replace, depth + 1);
+
+    if (key === "$regexp") {
+        const argument = value[key];
+        const item = next(argument[2]);
+
+        return Object.is(item, argument[2])
+            ? value
+            : { [key]: [argument[0], argument[1], item] };
+    }
+
+    if (key === "$literal") {
+        const argument = value[key];
+        const item = next(argument[0][1]);
+
+        return Object.is(item, argument[0][1])
+            ? value
+            : { [key]: [[argument[0][0], item]] };
+    }
+
+    if (key && key !== "$map" && key !== "$set")
+        return value;
+
+    let output;
+
+    for (const property of Object.keys(value)) {
+        const original = value[property];
+        const item = next(original);
+
+        if (!Object.is(item, original)) {
+            if (!output)
+                output = Array.isArray(value)
+                    ? value.slice()
+                    : { ...value };
+
+            define(output, property, item);
+        }
+    }
+
+    return output || value;
+}
+
+/*
+ * Repackage an already prepared representation for transportation.
+ *
+ * Extract raw sections from the root $binary array,
+ * restore only wire binary markers, and leave every
+ * other operator untouched.
+ */
+
+function prepareBinary(value, state) {
+    if (
+        !value ||
+        typeof value !== "object" ||
+        Array.isArray(value) ||
+        !own(value, "$binary") ||
+        !Array.isArray(value.$binary) ||
+        !value.$binary.length
+    ) {
+        return value;
+    }
+
+    const { $binary: entries, ...structured } = value;
+    const typeIds = new Array(entries.length);
+    const visited = new Set();
+
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+
+        if (!entry || typeof entry !== "object" || Array.isArray(entry))
+            fail("invalid binary entry");
+
+        const keys = Object.keys(entry);
+
+        if (keys.length !== 1)
+            fail("invalid binary entry");
+
+        const type = types.findIndex((Type, index) =>
+            Type && keys[0] === (
+                index === 14
+                    ? "$Buffer"
+                    : `$${Type.name}`
+            )
+        );
+
+        if (type < 0)
+            fail("unsupported binary type");
+
+        const bytes = entry[keys[0]];
+        const alignment = types[type].BYTES_PER_ELEMENT || 1;
+
+        if (!(bytes instanceof Uint8Array))
+            fail("expected raw Uint8Array bytes");
+
+        if (
+            typeof SharedArrayBuffer !== "undefined" &&
+            bytes.buffer instanceof SharedArrayBuffer
+        ) {
+            fail("shared buffers are unsupported");
+        }
+
+        if (bytes.byteLength % alignment)
+            fail("invalid binary length");
+
+        typeIds[i] = type;
+
+        state.sections.push({
+            bytes,
+            alignment
+        });
+    }
+
+    const transformed = mapBinaryValues(structured, item => {
+        if (operator(item) === "$binary")
+            fail("expected prepared binary reference");
+
+        const index = binaryReference(item);
+
+        if (index === null)
+            return item;
+
+        if (!Number.isSafeInteger(index) || index >= entries.length)
+            fail("invalid binary reference");
+
+        visited.add(index);
+
+        return {
+            $binary: [index, typeIds[index]]
+        };
+    });
+
+    if (visited.size !== entries.length)
+        fail("unreferenced binary section");
+
+    return transformed;
+}
+
+/*
  * Encode
+ *
+ * operators: true
+ *     Convert native JavaScript values into CoSON operators.
+ *     Extract binary values and generate the transport frame.
+ *
+ * operators: false
+ *     Preserve existing CoSON operators.
+ *     Extract the root $binary entries.
+ *     Package the representation for transportation.
+ *
+ * index: false
+ *     Disable reconstruction index generation.
  */
 
 export function encode(value, options) {
@@ -450,12 +632,37 @@ export function encode(value, options) {
         seen: new WeakSet()
     };
 
-    const transformed = transform(value, state);
+    const mode = options?.operators ?? true;
+
+    if (mode !== true && mode !== false)
+        fail("invalid operators mode");
+
+    const transformed = mode
+        ? transform(value, state)
+        : prepareBinary(value, state);
+
+    let entries;
+
+    if (!mode) {
+        // Input is already operator-form data.
+        // Inspect only to generate frame flags and indexes.
+        // Never apply native type conversion.
+
+        entries = collectIndex(transformed);
+
+        if (entries[0].length)
+            state.flags |= OPERATORS;
+
+        if (entries[1].length && !state.sections.length)
+            fail("missing binary sections");
+    }
 
     const index =
         state.flags && options?.index !== false
             ? encoder.encode(
-                JSON.stringify(collectIndex(transformed))
+                JSON.stringify(
+                    entries || collectIndex(transformed)
+                )
             )
             : null;
 
@@ -552,6 +759,7 @@ export function encode(value, options) {
 
 /*
  * Read and validate the envelope.
+ *
  * Supports indexed and unindexed frames.
  */
 
@@ -1012,16 +1220,12 @@ function preserveBinary(value, sections) {
     const visited = new Set();
     let references = 0;
 
-    function visit(value, depth = 0) {
-        if (depth > MAX_DEPTH)
-            fail("maximum depth exceeded");
+    const transformed = mapBinaryValues(value, value => {
+        // Prevent literal reference-shaped strings from
+        // becoming ambiguous during subsequent encoding.
 
-        if (
-            !value ||
-            typeof value !== "object"
-        ) {
-            return value;
-        }
+        if (binaryReference(value) !== null)
+            fail("reserved binary reference string");
 
         const key = operator(value);
 
@@ -1069,6 +1273,7 @@ function preserveBinary(value, sections) {
                 };
             } else {
                 const name = Object.keys(entries[index])[0];
+
                 const expected = type === 14
                     ? "$Buffer"
                     : `$${Type.name}`;
@@ -1083,35 +1288,8 @@ function preserveBinary(value, sections) {
             return `$binary[${index}]`;
         }
 
-        if (Array.isArray(value)) {
-            for (let i = 0; i < value.length; i++) {
-                const item = visit(
-                    value[i],
-                    depth + 1
-                );
-
-                if (!Object.is(item, value[i]))
-                    value[i] = item;
-            }
-
-            return value;
-        }
-
-        for (const key of Object.keys(value)) {
-            const original = value[key];
-            const item = visit(
-                original,
-                depth + 1
-            );
-
-            if (!Object.is(original, item))
-                define(value, key, item);
-        }
-
         return value;
-    }
-
-    visit(value);
+    });
 
     if (
         !references ||
@@ -1120,35 +1298,41 @@ function preserveBinary(value, sections) {
         fail("unreferenced binary section");
     }
 
-    define(value, "$binary", entries);
+    define(transformed, "$binary", entries);
 
-    return value;
+    return transformed;
 }
 
 /*
  * Decode
  *
- * reconstruct: true
+ * operators: true
  *     Restore native JavaScript values.
  *
- * reconstruct: "binary"
+ * operators: "binary"
  *     Restore binary values only.
  *
- * reconstruct: false
+ * operators: false
  *     Preserve encoded operators.
  *     Replace binary operators with path references.
  *     Attach typed binary sections to root $binary.
+ *
+ * The previous reconstruct option remains supported
+ * for backward compatibility.
  */
 
 export function decode(bytes, options) {
-    const mode = options?.reconstruct ?? true;
+    const mode =
+        options?.operators ??
+        options?.reconstruct ??
+        true;
 
     if (
         mode !== true &&
         mode !== false &&
         mode !== "binary"
     ) {
-        fail("invalid reconstruction mode");
+        fail("invalid operators mode");
     }
 
     const {

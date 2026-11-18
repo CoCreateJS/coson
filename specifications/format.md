@@ -15,6 +15,8 @@ The format combines:
 - Optional reconstruction indexing.
 - Alignment-aware binary reconstruction.
 
+The public `operators` option independently controls native-value/operator conversion. Operator processing, binary framing, and native reconstruction are separate concerns: a frame can carry raw binary sections while a decoded value preserves its operator representation.
+
 Ordinary JSON-compatible values retain their natural representation. Extended types are represented using reserved strings and inline operator objects.
 
 Binary content is stored independently of the structured representation without Base64 encoding or numeric-array conversion.
@@ -254,7 +256,7 @@ The second argument is the binary type identifier.
 
 ### 6.1 Binary Type Identifiers
 
-| Identifier | Wire type | Descriptor key in `reconstruct: false` mode | Element size |
+| Identifier | Wire type | Descriptor key in `operators: false` mode | Element size |
 |---:|---|---|---:|
 | 0 | ArrayBuffer | `$ArrayBuffer` | 1 byte |
 | 1 | Int8Array | `$Int8Array` | 1 byte |
@@ -408,7 +410,7 @@ Implementations must not assume that indexed metadata received from an untrusted
 
 ## 8. Encoding
 
-Encoding consists of the following operations:
+With `operators: true`, encoding consists of the following operations:
 
 1. Validate the input value.
 2. Identify extended types.
@@ -424,15 +426,34 @@ The encoded result is returned as a Uint8Array.
 
 ### 8.1 Encoding API
 
-    encode(value)
+    encode(value, options)
+
+`options.operators` defaults to `true`.
+
+    encode(value, { operators: true })
+
+This converts native JavaScript values into CoSON operators, extracts raw binary sections, optionally generates a reconstruction index, and builds a frame.
+
+    encode(value, { operators: false })
+
+This accepts a prepared operator representation. It preserves non-binary operators, extracts bytes from a non-empty root `$binary` descriptor array, replaces canonical direct binary references with the wire-level `$binary` operator, and constructs the frame. It does not run native-value conversion.
+
+When `operators` is false, each descriptor must be a one-key object using a registered binary descriptor key; its value must be a `Uint8Array` containing raw bytes. All sections must be referenced. References must identify an existing section, and section byte lengths must satisfy type alignment. SharedArrayBuffer-backed bytes are rejected.
+
+The prepared root `$binary` array is transport metadata and is omitted from the structured JSON when it contains sections. An empty `$binary` array is not treated as a binary container by the current encoder and remains ordinary structured data.
+
+The decoded prepared reference syntax is the literal string `$binary[index]`, where `index` is canonical non-negative decimal notation (`0` or a nonzero digit followed by decimal digits). It identifies the entry at that index in the root `$binary` array. This syntax is reserved in prepared envelopes and is not an executable expression.
+
+The operation does not mutate the input. It still inspects reference positions, serializes structured JSON, creates frame storage and copies structured and binary bytes into the frame.
 
 Optional configuration:
 
     encode(value, {
+        operators: true,
         index: false
     })
 
-Disabling index generation produces an unindexed payload.
+`operators` and `index` are independent options. Disabling index generation produces an unindexed payload. With `operators: false`, the index is generated from the prepared representation after binary references have been converted to wire operators.
 
 Encoding does not modify the original input value.
 
@@ -446,53 +467,29 @@ Decoding consists of the following operations:
 4. Parse the structured JSON.
 5. Reconstruct extended values when requested.
 
-If the payload contains no extended type operators, the parsed structured representation is returned directly.
+With native reconstruction enabled, if the payload contains no extended type operators, the parsed structured representation is returned directly. When a reconstruction index is available, it is used automatically; otherwise, the decoder discovers extended types through structured traversal. With `operators: false`, binary references are instead discovered by traversal of the parsed representation and the reconstruction index is not used for that conversion.
 
-When a reconstruction index is available, the decoder uses it automatically.
+### 9.1 Decoding API and operator modes
 
-Otherwise, the decoder discovers extended types through structured traversal.
+    decode(payload, options)
 
-### 9.1 Decoding API
+`options.operators` defaults to `true`.
 
-Default decoding:
-
-    decode(payload)
-
-Explicit full reconstruction:
-
-    decode(payload, {
-        reconstruct: true
-    })
-
-Binary-only reconstruction:
-
-    decode(payload, {
-        reconstruct: "binary"
-    })
-
-Structured representation without reconstruction:
-
-    decode(payload, {
-        reconstruct: false
-    })
-
-### 9.2 Reconstruction Modes
-
-| Mode | Behavior |
+| `operators` | Behavior |
 |---|---|
-| Omitted | Restore all extended values |
-| true | Restore all extended values |
-| "binary" | Restore binary values only |
-| false | Preserve non-binary operators; replace binary operators with string references and attach typed raw-byte descriptors to the root when sections exist |
+| `true` or omitted | Reconstruct all supported native values. |
+| `false` | Preserve operators; replace binary wire operators with direct string references and attach typed raw-byte descriptors to the root when sections exist. |
+| `"binary"` | Reconstruct binary values and preserve non-binary operators. Decode only. |
 
-The reconstruction strategy is selected automatically based on the envelope.
+The earlier `reconstruct` option remains supported for backward compatibility. A non-nullish `operators` option takes precedence over `reconstruct`; if it is omitted or nullish, the legacy option is consulted. The reconstruction index remains independent of this choice. Indexed and unindexed frames remain supported; unindexed full reconstruction uses recursive fallback, while unindexed binary-only reconstruction collects binary paths.
 
-### 9.3 Reconstruction-disabled binary representation
+### 9.2 Operator-preserving decoded representation
 
-The wire-level binary operator remains `{ "$binary": [sectionIndex, typeIdentifier] }`. With `reconstruct: false`, the decoder parses the structured JSON, recursively visits it, and replaces each valid binary operator at its original location with the string `"$binary[index]"`. It then attaches a `$binary` array to the original root object. Each array entry is a passive one-key type descriptor whose value is a `Uint8Array` view over the corresponding raw section bytes. For example:
+The wire-level binary operator remains `{ "$binary": [sectionIndex, typeIdentifier] }`. With `operators: false`, decoding parses the structured JSON and traverses it to replace each binary wire operator with a direct reference string `"$binary[index]"`. Other operators, such as `$date`, remain in the structured representation. The decoder attaches a `$binary` array to the original root object; each entry is a one-key type descriptor containing a `Uint8Array` view over the corresponding raw section bytes. For example:
 
     {
         "method": "upload",
+        "created": { "$date": 1767225600000 },
         "image": "$binary[0]",
         "pixels": "$binary[1]",
         "$binary": [
@@ -501,18 +498,28 @@ The wire-level binary operator remains `{ "$binary": [sectionIndex, typeIdentifi
         ]
     }
 
-Descriptor keys correspond to the binary type identifiers in Section 6.1, including `$Buffer` for type 14. Descriptor values remain byte views; the original type is represented by the key and no native typed-array instance is reconstructed in this mode. Views share and retain the frame's backing memory.
+Descriptor keys correspond to the binary type identifiers in Section 6.1, including `$Buffer` for type 14. Descriptor values remain byte views; the original type is represented by the key and no native typed-array instance is reconstructed in this mode. Views share and retain the frame's backing memory. The reference string resolves by index into this root array; it is not an executable operator.
 
-This is an in-memory decoded representation, not a change to the wire format. The conversion traverses the parsed structure and allocates reference strings and descriptor containers; it does not copy the section bytes. The traversal discovers references in the parsed value and does not use the reconstruction index. Every section must be referenced, indexes and type identifiers must be valid, and conflicting types for a section are rejected.
+This is an in-memory decoded representation, not a change to the wire format. The conversion traverses the parsed structure and allocates reference strings and descriptor containers; it does not copy the section bytes. The traversal discovers references in the parsed value and does not use the reconstruction index. Every section must be referenced, indexes and type identifiers must be valid, and conflicting types for a section are rejected. Canonical strings matching `"$binary[index]"` are reserved in this mode and cause decoding to fail, preventing ambiguous literal strings in the prepared representation; automatic escaping is not implemented.
 
-If sections exist, the parsed root must be a non-array object, must not itself be an operator, and must not have its own `$binary` property; otherwise decoding throws `TypeError`. With no sections, the parsed value is returned unchanged. Since ordinary strings matching `"$binary[index]"` are not escaped in this mode, such a string can be ambiguous with a binary reference. Consumers must validate the exact reference syntax before resolving it and must not evaluate reference strings as code. CoSON does not currently provide an encoder for this in-memory envelope or a method to reconstruct native values from it; use the original frame for normal reconstruction.
+If sections exist, the parsed root must be a non-array object, must not itself be an operator, and must not have its own `$binary` property; otherwise decoding throws `TypeError`. With no sections, the parsed value is returned unchanged. The root `$binary` property is reserved for transport metadata. Applications resolving these references must validate their syntax and index; neither CoSON nor an external consumer should evaluate reference strings as code.
 
 Example:
 
-    const parsed = decode(payload, { reconstruct: false });
+    const parsed = decode(payload, { operators: false });
     const imageBytes = parsed.$binary[0].$Uint8Array;
 
-Binary-only reconstruction leaves other extended type representations unchanged.
+### 9.3 Re-encoding a prepared representation
+
+`encode(prepared, { operators: false })` is the inverse transport operation for a prepared representation with a non-empty root `$binary` array. It validates the descriptor entries, extracts their raw bytes, removes the root metadata from the structured section, converts each exact `"$binary[index]"` reference into the existing wire operator with the associated type identifier, preserves non-binary operators, generates an index when enabled, and builds a normal CoSON frame. No native application values are reconstructed or converted. The input object is not mutated.
+
+All descriptor sections must be referenced. A reference must use canonical decimal syntax, identify an available section, and be unambiguous; unreferenced entries and invalid references are rejected. Only registered type descriptor keys and raw `Uint8Array` bytes are accepted. Typed-array alignment constraints are checked. A prepared object that is changed must be re-indexed from its current contents; previously generated paths are not reused. With no sections, the decoded operator representation can be encoded with `operators: false` as structured operator data, subject to normal validation.
+
+The binary-preserving path requires a non-array ordinary root object when sections are present. Root arrays and root binary values remain supported by the standard `operators: true` path, not by the prepared binary-envelope path.
+
+These operator-processing modes reuse the current frame magic, version, flags, length encoding, structured JSON encoding, binary-section layout, type identifiers, alignment, and reconstruction-index format. They do not introduce a wire-format version or alter the wire-level binary marker.
+
+The previous binary-only behavior is selected with `decode(payload, { operators: "binary" })`; it reconstructs binary values while leaving non-binary operator representations unchanged.
 
 ## 10. Type Fidelity
 

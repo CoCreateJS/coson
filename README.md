@@ -171,33 +171,36 @@ Index handling is automatic and does not require callers to manage reconstructio
 
 The index introduces some encoding work and payload overhead. Its effectiveness depends on the number and distribution of values requiring reconstruction.
 
-### Conditional reconstruction
+### Operator processing and deferred reconstruction
 
-Applications do not always need fully restored native objects.
+`operators` controls whether CoSON converts native JavaScript values to and from CoSON operators. It defaults to `true` for both encoding and decoding.
 
-CoSON supports different decoding modes:
+| Method | `operators` | Behavior |
+|---|---|---|
+| `encode` | `true` (default) | Convert native values to operators and build a transport frame. |
+| `encode` | `false` | Transport an already prepared operator representation and its root binary sections without converting non-binary operators. |
+| `decode` | `true` (default) | Reconstruct supported native JavaScript values. |
+| `decode` | `false` | Preserve operators and expose binary sections through root `$binary` metadata when present. |
+| `decode` | `"binary"` | Reconstruct binary values while preserving non-binary operators. |
+
+The value `"binary"` is decode-only. The earlier `reconstruct` decode option remains available for backward compatibility; a non-nullish `operators` option takes precedence, otherwise the legacy option is consulted.
 
 ```javascript
-// Default: reconstruct all supported native types
-decode(payload);
+const frame = encode(value, { operators: true });
+const restored = decode(frame, { operators: true });
 
-// Explicit full reconstruction
-decode(payload, { reconstruct: true });
-
-// Reconstruct binary values only
-decode(payload, { reconstruct: "binary" });
-
-// Parse the intermediate structured representation
-decode(payload, { reconstruct: false });
+// Preserve the CoSON operator representation for inspection or forwarding.
+const prepared = decode(frame, { operators: false });
 ```
 
-The `reconstruct: false` mode parses the structured JSON and leaves non-binary operators as encoded. Binary operators are represented in the returned object as direct string references. CoSON attaches a `$binary` array to the original root object; its entries are passive type descriptors containing raw `Uint8Array` views into the input payload.
+With `operators: false`, decoding leaves non-binary operator objects intact. Binary wire operators become direct string references, and raw binary bytes are attached to the original root object as typed descriptors:
 
 For example, a message with two binary values is returned in this shape:
 
 ```javascript
 {
     method: "upload",
+    created: { $date: 1767225600000 },
     image: "$binary[0]",
     pixels: "$binary[1]",
     $binary: [
@@ -208,23 +211,67 @@ For example, a message with two binary values is returned in this shape:
 ```
 
 ```javascript
-const parsed = decode(payload, { reconstruct: false });
-const imageReference = parsed.image; // "$binary[0]"
-const imageBytes = parsed.$binary[0].$Uint8Array;
-const pixelBytes = parsed.$binary[1].$Uint16Array;
+const prepared = decode(payload, { operators: false });
+const imageReference = prepared.image; // "$binary[0]"
+const imageBytes = prepared.$binary[0].$Uint8Array;
+const pixelBytes = prepared.$binary[1].$Uint16Array;
 ```
 
 Each descriptor key preserves the encoded binary type. The descriptor value is raw bytes, not a reconstructed typed array. Available keys are `$ArrayBuffer`, `$Int8Array`, `$Uint8Array`, `$Uint8ClampedArray`, `$Int16Array`, `$Uint16Array`, `$Int32Array`, `$Uint32Array`, `$Float32Array`, `$Float64Array`, `$BigInt64Array`, `$BigUint64Array`, `$DataView`, `$Float16Array`, and `$Buffer`. `$Float16Array` is available when the runtime provides `Float16Array`; `$Buffer` requires the global Node.js `Buffer` constructor and a matching Buffer value.
 
-The references and descriptors are an in-memory representation, not another CoSON wire format. Resolving a reference requires a consumer that validates the exact `"$binary[index]"` form and selects the corresponding descriptor; CoSON does not evaluate these strings. Ordinary user strings that exactly match this pattern can collide with references. This mode is not guaranteed to preserve that distinction, and the returned envelope is not currently accepted by `encode()` as a way to recreate the original frame. Use the original encoded payload with `decode()` when native reconstruction is needed.
+| Native binary type | Descriptor operator |
+|---|---|
+| ArrayBuffer | `$ArrayBuffer` |
+| Int8Array, Uint8Array, Uint8ClampedArray | `$Int8Array`, `$Uint8Array`, `$Uint8ClampedArray` |
+| Int16Array, Uint16Array, Int32Array, Uint32Array | `$Int16Array`, `$Uint16Array`, `$Int32Array`, `$Uint32Array` |
+| Float16Array, Float32Array, Float64Array | `$Float16Array`, `$Float32Array`, `$Float64Array` |
+| BigInt64Array, BigUint64Array | `$BigInt64Array`, `$BigUint64Array` |
+| DataView, Buffer | `$DataView`, `$Buffer` |
 
-The root value must be an object when raw sections are present, and it must not already contain its own `$binary` property. Otherwise this mode throws because it cannot attach the section array without a property conflict. With no binary sections, the parsed structured value is returned as-is.
+The references and descriptors are an in-memory representation, not another CoSON wire format. `encode(prepared, { operators: false })` accepts this prepared form and converts the references back to wire-level binary operators. CoSON does not execute non-binary operators or evaluate reference strings.
+
+With binary sections, the decoded root must be a non-array object that is not itself an operator and has no own `$binary` property. A literal string matching the canonical reference form, such as `"$binary[0]"`, is reserved in this prepared representation: decoding with operators disabled rejects it to prevent ambiguity. The root `$binary` property is reserved for transport metadata. With no binary sections, `decode(..., { operators: false })` returns the parsed structured value unchanged.
 
 Creating the representation still parses JSON, traverses the object, and allocates reference strings and descriptor containers. The raw byte views share and retain the payload's backing memory; copy bytes when independent ownership is required or when retaining the full payload is undesirable. This mode should not be assumed to have zero processing or allocation cost.
 
-This is useful when applications need to inspect or process structured information without immediately constructing every native object.
+### Symmetrical operator-preserving transport
 
-Potential uses include request inspection and custom processing. Routing, database operations, workflow execution, or forwarding require application-side integration; this representation does not add those integrations by itself.
+An application can forward or modify a prepared envelope and package it into another frame without reconstructing native application values in between:
+
+```javascript
+const incoming = encode(message); // Native values -> frame
+const prepared = decode(incoming, { operators: false });
+
+prepared.server = destination;
+
+const outgoing = encode(prepared, { operators: false });
+const received = decode(outgoing, { operators: true });
+```
+
+`prepared` and a subsequent `decode(outgoing, { operators: false })` contain equivalent operator structures and binary contents. Object and byte-view identity is not guaranteed. The full lifecycle is:
+
+```text
+Native JavaScript
+  → encode(operators: true)
+  → CoSON frame
+  → decode(operators: false)
+  → operator representation + root $binary metadata
+  → application processing / routing / storage
+  → encode(operators: false)
+  → CoSON frame
+  → decode(operators: true)
+  → Native JavaScript
+```
+
+This supports deferred reconstruction patterns for routing, authorization, workflow processing, CRUD handling, storage, replication, and forwarding. CoSON supplies the representation; it does not itself implement these application integrations or execute CoCreateJS AST operators.
+
+`encode(value, { operators: false })` expects an already prepared, JSON-compatible operator representation. It extracts raw bytes from root `$binary` descriptors, removes that non-empty metadata container from the structured JSON, converts valid direct binary references to the existing wire marker, preserves other operators, and builds the frame. It does not perform native JavaScript type conversion. The input object is not mutated. Binary sections must use supported descriptor keys with raw `Uint8Array` bytes; every section must be referenced, references must be valid, and multibyte payload lengths must meet their type's alignment requirement.
+
+The prepared binary path requires a non-array object root. Root arrays and root binary values can use the regular `operators: true` serialization and reconstruction path. Do not add literal strings in the reserved `"$binary[index]"` form to a prepared object: the encoder interprets a valid index as a binary reference and rejects invalid or unavailable indexes.
+
+An empty `$binary: []` is not treated as a binary section container by the current encoder and remains ordinary structured data. Do not use it as a prepared binary envelope.
+
+Disabling operator processing does not disable framing or all structured work. CoSON still inspects references, serializes JSON, and can generate reconstruction indexes. Frame construction allocates output storage and copies structured and binary bytes. No benchmark claims are made here for this mode.
 
 ## Serialization architecture
 
