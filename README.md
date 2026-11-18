@@ -45,13 +45,13 @@ We benchmarked COSON against CBOR-X and BSON on identical inputs. Two benchmark 
 
 This dataset had 34 properties, eight array entries, and no binary values. Every codec reconstructed it losslessly. Times are milliseconds; lower is faster.
 
-| Codec | Encode | Decode | Round trip | Encoded bytes | Retained JS heap | Retained backing |
-|---|---:|---:|---:|---:|---:|---:|
-| COSON (Inline Hybrid + SplitBinary) | 0.482 | 0.283 | 0.812 | 33,326 | 37.1 KiB | 32.5 KiB |
-| CBOR-X | **0.107** | **0.182** | **0.335** | **32,643** | **6.2 KiB** | 380 KiB |
-| BSON | 0.110 | 0.417 | 0.577 | 32,817 | 37.5 KiB | 32.0 KiB |
+| Codec | Encode | Decode | Round trip | Encoded bytes | Retained JS heap | Retained backing | Combined retained |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| COSON (Inline Hybrid + SplitBinary) | 0.482 | 0.283 | 0.812 | 33,326 | 37.1 KiB | 32.5 KiB | 102.2 KiB |
+| CBOR-X | **0.107** | **0.182** | **0.335** | **32,643** | **6.2 KiB** | 380 KiB | **6.2 KiB** |
+| BSON | 0.110 | 0.417 | 0.577 | 32,817 | 37.5 KiB | 32.0 KiB | 69.6 KiB |
 
-Here COSON decoded about **32% faster than BSON**, while its complete round trip was about **41% slower**. CBOR-X had the fastest encoding, decoding, and round trip in this case. COSON retained much less backing storage than CBOR-X, but more JavaScript heap; its backing storage and heap were close to BSON. This is one workload sample, not a general memory guarantee.
+Here COSON decoded about **32% faster than BSON**, while its complete round trip was about **41% slower**. CBOR-X had the fastest encoding, decoding, and round trip in this case. COSON retained much less backing storage than CBOR-X, but more JavaScript heap; its backing storage and heap were close to BSON. Combined retained memory was higher for COSON in this sample. These figures do not support a general claim that COSON uses less total memory; the results vary by workload and memory measure.
 
 ### Structured-only Inline Hybrid: shape and crossover
 
@@ -75,9 +75,15 @@ This points to a possible fit for decode-heavy workloads, especially when object
 
 ### Memory and binary tradeoffs
 
-For the package's 32 KiB common-values case, COSON retained about **37.1 KiB of JavaScript heap** and **32.5 KiB of backing storage**. CBOR-X retained about **6.2 KiB of heap** and **380 KiB of backing storage**; BSON retained about **37.5 KiB of heap** and **32.0 KiB of backing storage**. Peak memory depends on the runtime and sampling window, so the benchmark reports heap and backing storage separately.
+Server memory matters because live bytes affect how much concurrent work a process can hold and, at scale, the capacity that must be provisioned. For the package's 32 KiB common-values case, COSON retained about **37.1 KiB of JavaScript heap** and **32.5 KiB of backing storage**. CBOR-X retained about **6.2 KiB of heap** and **380 KiB of backing storage**; BSON retained about **37.5 KiB of heap** and **32.0 KiB of backing storage**. Combined retained memory was higher for COSON in this case, so the results do not establish a general server-memory or infrastructure-cost reduction. Production server load and peak RSS should be measured before making that claim.
 
 COSON can decode typed arrays as views into the encoded payload, avoiding a separate copy of those bytes. That can reduce duplicate backing storage, but a small retained view also keeps the entire encoded payload alive. Copy a decoded view when it needs to outlive a large payload. The external codecs did not pass lossless round trips for the tested binary datasets, so the benchmark does not claim a binary-memory or speed win over them.
+
+### Readable structured data
+
+COSON frames contain a UTF-8 JSON structured section followed by raw binary sections. This means the structured portion is inspectable with ordinary text tools, unlike an opaque binary document. A server can parse or inspect that section to route, validate, or work with readable string content without reconstructing every value into its native JavaScript type.
+
+The section is COSON's tagged skeleton, not a plain JSON object at the start of the payload. A reader must skip the frame header and length prefixes to reach it, then parse its JSON; special values remain tagged until COSON reconstructs them. Use decode when server logic needs ordinary JavaScript objects, Dates, Maps, typed arrays, or other restored values. This can offer a selective server-side path, but it is not zero-work or a drop-in replacement for decoding.
 
 ### Type coverage
 
