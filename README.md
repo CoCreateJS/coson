@@ -1,8 +1,16 @@
 # COSON
 
-**Lossless JavaScript serialization, designed for efficient servers.**
+### CoCreate Object Serialization Notation
 
-COSON is a dependency-free ESM encoder and decoder for browser and Node.js applications. It preserves supported JavaScript types, including binary data, and keeps the serialized structured content readable.
+**One format. Two functions. Zero dependencies.**
+
+COSON is a lightweight, lossless, JavaScript-native serialization format designed to preserve data structures, native types, and raw binary while minimizing serialization overhead and memory consumption.
+
+By combining native JSON processing with inline type representation and raw binary framing, COSON delivers a unified serialization architecture for application data, network communication, database persistence, and distributed systems.
+
+**Preserve the structure. Preserve the types. Preserve the binary.**
+
+Designed for memory efficiency. Built for scale.
 
 Install with npm:
 
