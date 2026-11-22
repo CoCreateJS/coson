@@ -37,7 +37,7 @@ The envelope contains a format identifier, version, feature flags, structured le
 
 Native JSON.stringify and JSON.parse perform the conversion between structured JavaScript values and JSON text. CoSON adds transformations only where required to preserve types and binary data. Feature flags indicate whether extended operators and a reconstruction index are present. When operator processing is enabled, ordinary JSON payloads can bypass the post-parse native reconstruction traversal.
 
-The public interface is intentionally small: `encode(value, options)` produces a `Uint8Array`, and `decode(payload, options)` reads a CoSON frame. The `operators` option defaults to `true` on both methods, converting native values to and from CoSON operators. Setting it to `false` preserves an existing operator representation while preparing or exposing raw binary sections; decoding also supports `operators: "binary"` to reconstruct binary values while preserving other operators. The reference implementation is synchronous and has no runtime dependencies.
+The public interface is intentionally small: `encode(value, options)` produces a `Uint8Array`, and `decode(payload, options)` reads a CoSON frame. Encoding defaults to `operators: true`; decoding defaults to `operators: false`, preserving operators unless native reconstruction is explicitly requested. Setting `operators: false` preserves an existing operator representation while preparing or exposing raw binary sections; decoding also supports `operators: "binary"` to reconstruct binary values while preserving other operators. The reference implementation is synchronous and has no runtime dependencies.
 
 This design is hybrid rather than purely textual or fully custom binary. It preserves the advantages of a familiar structured notation while allowing binary contents to remain native bytes. It does not claim that native JSON parsing is universally faster than specialized binary decoding.
 
@@ -47,7 +47,7 @@ This design is hybrid rather than purely textual or fully custom binary. It pres
 | Uint8Array | {"$binary":[0,2]} |
 | Literal "$undefined" | {"$string":"$undefined"} |
 
-The binary row describes the representation inside the encoded frame. With `decode(payload, { operators: false })`, that wire operator becomes a direct string reference such as `"$binary[0]"`, and the root `$binary` array contains a typed descriptor such as `{ $Uint8Array: bytes }`. This decoded form is in-memory only; it does not change the wire representation.
+The binary row describes the representation inside the encoded frame. With `decode(payload, { operators: false })`, that wire operator becomes an in-memory `binary[index]` reference and the owning object contains a local `binary` array with a typed descriptor such as `{ $Uint8Array: bytes }`. This decoded form is in-memory only; it does not change the wire representation.
 
 
 ## 3. Memory architecture
@@ -71,27 +71,29 @@ The baseline decoder parses the structured JSON, then visits its values to resto
 
 For K independent indexed targets of average path depth d, path access costs approximately O(Kd), plus restoration work and index parsing. Nested Map, Set and other operators can still require traversal inside their arguments. JSON parsing itself is unchanged. Sparse extended values in a large structure are the most promising case; dense extended values or small documents may favor direct traversal.
 
-The proposed index uses path segments rather than dot-separated strings so literal dots in object keys remain unambiguous. It distinguishes full reconstruction from binary-only reconstruction. The default decode call should restore all supported values, choosing indexed or recursive reconstruction automatically.
+The proposed index uses path segments rather than dot-separated strings so literal dots in object keys remain unambiguous. It distinguishes full reconstruction from binary-only reconstruction. Native value reconstruction occurs only when the caller requests `operators: true`; the default decode preserves operators.
 
-In the current implementation, `decode(frame, { operators: false })` leaves non-binary operators in their structured form and converts binary wire operators into references in the returned in-memory envelope. The original message remains at the root; binary references are strings and raw bytes are attached as typed descriptors:
+In the current implementation, `decode(frame, { operators: false })` leaves operators in structured form. For CRUD messages, binary references and raw byte descriptors are attached to each owning object:
 
     {
-        method: "upload",
-        image: "$binary[0]",
-        pixels: "$binary[1]",
-        $binary: [
-            { $Uint8Array: bytes0 },
-            { $Uint16Array: bytes1 }
-        ]
+        method: "object.create",
+        object: [{
+            image: "binary[0]",
+            pixels: "binary[1]",
+            binary: [
+                { $Uint8Array: bytes0 },
+                { $Uint16Array: bytes1 }
+            ]
+        }]
     }
 
-The `$binary` entries contain `Uint8Array` views into the input frame's storage. The descriptor key carries the original binary type; the descriptor value is raw bytes rather than a reconstructed typed array. This mode still JSON-parses and traverses the structured value and allocates reference strings and descriptor containers. It avoids copying binary bytes for the views, but should not be treated as zero-work or as a measured performance optimization.
+The local `binary` entries contain `Uint8Array` views into the input frame's storage. The descriptor key carries the original binary type; the descriptor value is raw bytes rather than a reconstructed typed array. This mode still JSON-parses and traverses the structured value and allocates reference strings and descriptor containers. It avoids copying binary bytes for the views, but should not be treated as zero-work or as a measured performance optimization.
 
-When binary sections exist, this in-memory form requires a non-array object root that is not itself an operator and has no own `$binary` property. Canonical strings such as `"$binary[0]"` are reserved and rejected during this decoding mode to prevent ambiguous prepared references; they are not automatically escaped. The root `$binary` property is reserved for transport metadata. The wire operator remains `{ "$binary": [sectionIndex, typeIdentifier] }`; normal native reconstruction uses the frame.
+For CRUD messages, each target object must be an object and its `binary` property is reserved for descriptors. Canonical strings such as `binary[0]` are reserved and rejected when binary sections are present. Each section belongs to one owner; references are local to that object. Non-CRUD messages retain root ownership. The wire operator remains `{ "$binary": [sectionIndex, typeIdentifier] }`; normal native reconstruction uses the frame.
 
-Operator processing is symmetrical across a transport relay. A receiver can call `decode(frame, { operators: false })`, inspect or modify the structured representation, and pass that prepared object to `encode(prepared, { operators: false })`. The encoder extracts the typed raw-byte descriptors, replaces direct references with the existing wire-level binary operators, preserves non-binary operators, and emits a normal CoSON frame. An eventual receiver can reconstruct native values with `decode(frame, { operators: true })`. This path still serializes JSON, inspects references, can generate reconstruction indexes, allocates outgoing frame storage, and copies bytes into it; it is not traversal-free or zero-copy.
+Operator processing is symmetrical across a transport relay. A receiver can call `decode(frame, { operators: false })`, inspect or modify the structured representation, and pass that prepared object to `encode(prepared, { operators: false })`. The encoder extracts each owning object's raw-byte descriptors, replaces local references with the existing wire-level binary operators, preserves other operators, and emits a normal CoSON frame. An eventual receiver can reconstruct native values with `decode(frame, { operators: true })`. This path still serializes JSON, inspects references, can generate reconstruction indexes, allocates outgoing frame storage, and copies bytes into it; it is not traversal-free or zero-copy.
 
-This representation can support deferred processing patterns for intermediate systems, including routing, metadata checks, storage, replication, and forwarding while preserving binary sections. CoSON provides serialization and transport representation only; application and CoCreateJS AST integrations are separate work. Reference strings must be resolved by validating their syntax and index, never by evaluating them as code. An empty root `$binary` array is not treated as a binary container by the current operators-disabled encoder.
+This representation can support deferred processing patterns for intermediate systems, including routing, metadata checks, storage, replication, and forwarding while preserving binary sections. CoSON provides serialization and transport representation only; application and CoCreateJS AST integrations are separate work. Reference strings must be resolved by validating their syntax and index, never by evaluating them as code. Empty object-local `binary` arrays are ordinary structured data and should be omitted when no sections exist.
 
 Index metadata belongs inside the serialization envelope, making the strategy independent of WebSocket, HTTP or storage. Untrusted indexes require validation of paths, operator identities and completeness. The current experimental implementation validates individual targets but does not independently establish completeness. The index is not yet a validated production optimization.
 

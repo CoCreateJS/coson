@@ -171,14 +171,14 @@ The index introduces some encoding work and payload overhead. Its effectiveness 
 
 ### Operator processing and deferred reconstruction
 
-`operators` controls whether CoSON converts native JavaScript values to and from CoSON operators. It defaults to `true` for both encoding and decoding.
+`operators` controls whether CoSON converts native JavaScript values to and from CoSON operators. Encoding defaults to `true`; decoding defaults to `false`, so operator evaluation is opt-in.
 
 | Method | `operators` | Behavior |
 |---|---|---|
 | `encode` | `true` (default) | Convert native values to operators and build a transport frame. |
-| `encode` | `false` | Transport an already prepared operator representation and its root binary sections without converting non-binary operators. |
-| `decode` | `true` (default) | Reconstruct supported native JavaScript values. |
-| `decode` | `false` | Preserve operators and expose binary sections through root `$binary` metadata when present. |
+| `encode` | `false` | Transport an already prepared operator representation and its object-local binary sections without converting non-binary operators. |
+| `decode` | `false` (default) | Preserve operators and expose binary sections through their owning object's `binary` metadata. |
+| `decode` | `true` | Reconstruct supported native JavaScript values. |
 | `decode` | `"binary"` | Reconstruct binary values while preserving non-binary operators. |
 
 The value `"binary"` is decode-only. The earlier `reconstruct` decode option remains available for backward compatibility; a non-nullish `operators` option takes precedence, otherwise the legacy option is consulted.
@@ -191,29 +191,26 @@ const restored = decode(frame, { operators: true });
 const prepared = decode(frame, { operators: false });
 ```
 
-With `operators: false`, decoding leaves non-binary operator objects intact. Binary wire operators become direct string references, and raw binary bytes are attached to the original root object as typed descriptors:
+With `operators: false`, decoding leaves non-binary operator objects intact. Binary wire operators become direct string references, and raw bytes are attached to their owning object as typed descriptors. For CRUD methods, each object under `object` owns a separate array; its references start at `binary[0]`:
 
 For example, a message with two binary values is returned in this shape:
 
 ```javascript
 {
-    method: "upload",
+    method: "object.create",
     created: { $date: 1767225600000 },
-    image: "$binary[0]",
-    pixels: "$binary[1]",
-    $binary: [
-        { $Uint8Array: bytes0 },
-        { $Uint16Array: bytes1 }
-    ]
+    object: [{
+        image: "binary[0]",
+        pixels: "binary[1]",
+        binary: [
+            { $Uint8Array: bytes0 },
+            { $Uint16Array: bytes1 }
+        ]
+    }]
 }
 ```
 
-```javascript
-const prepared = decode(payload, { operators: false });
-const imageReference = prepared.image; // "$binary[0]"
-const imageBytes = prepared.$binary[0].$Uint8Array;
-const pixelBytes = prepared.$binary[1].$Uint16Array;
-```
+Local indexes are independent: each object in an `object` array may refer to `binary[0]`. Non-CRUD messages retain the root as the binary owner.
 
 Each descriptor key preserves the encoded binary type. The descriptor value is raw bytes, not a reconstructed typed array. Available keys are `$ArrayBuffer`, `$Int8Array`, `$Uint8Array`, `$Uint8ClampedArray`, `$Int16Array`, `$Uint16Array`, `$Int32Array`, `$Uint32Array`, `$Float32Array`, `$Float64Array`, `$BigInt64Array`, `$BigUint64Array`, `$DataView`, `$Float16Array`, and `$Buffer`. `$Float16Array` is available when the runtime provides `Float16Array`; `$Buffer` requires the global Node.js `Buffer` constructor and a matching Buffer value.
 
@@ -226,9 +223,9 @@ Each descriptor key preserves the encoded binary type. The descriptor value is r
 | BigInt64Array, BigUint64Array | `$BigInt64Array`, `$BigUint64Array` |
 | DataView, Buffer | `$DataView`, `$Buffer` |
 
-The references and descriptors are an in-memory representation, not another CoSON wire format. `encode(prepared, { operators: false })` accepts this prepared form and converts the references back to wire-level binary operators. CoSON does not execute non-binary operators or evaluate reference strings.
+The references and descriptors are an in-memory representation, not another CoSON wire format. `encode(prepared, { operators: false })` accepts this prepared form and converts references back to the existing wire-level binary operators. CoSON does not execute non-binary operators or evaluate reference strings.
 
-With binary sections, the decoded root must be a non-array object that is not itself an operator and has no own `$binary` property. A literal string matching the canonical reference form, such as `"$binary[0]"`, is reserved in this prepared representation: decoding with operators disabled rejects it to prevent ambiguity. The root `$binary` property is reserved for transport metadata. With no binary sections, `decode(..., { operators: false })` returns the parsed structured value unchanged.
+For CRUD payloads, each binary-bearing owner must be an object and its `binary` property is reserved for descriptors. Canonical strings matching `binary[n]` are reserved in owners with binary metadata. Every section must be referenced by exactly one owner; missing, stale, conflicting, or unreferenced entries are rejected. With no binary sections, `decode(..., { operators: false })` returns the parsed structured value unchanged.
 
 Creating the representation still parses JSON, traverses the object, and allocates reference strings and descriptor containers. The raw byte views share and retain the payload's backing memory; copy bytes when independent ownership is required or when retaining the full payload is undesirable. This mode should not be assumed to have zero processing or allocation cost.
 
@@ -253,7 +250,7 @@ Native JavaScript
   → encode(operators: true)
   → CoSON frame
   → decode(operators: false)
-  → operator representation + root $binary metadata
+  → operator representation + object-local binary metadata
   → application processing / routing / storage
   → encode(operators: false)
   → CoSON frame
@@ -263,11 +260,11 @@ Native JavaScript
 
 This supports deferred reconstruction patterns for routing, authorization, workflow processing, CRUD handling, storage, replication, and forwarding. CoSON supplies the representation; it does not itself implement these application integrations or execute CoCreateJS AST operators.
 
-`encode(value, { operators: false })` expects an already prepared, JSON-compatible operator representation. It extracts raw bytes from root `$binary` descriptors, removes that non-empty metadata container from the structured JSON, converts valid direct binary references to the existing wire marker, preserves other operators, and builds the frame. It does not perform native JavaScript type conversion. The input object is not mutated. Binary sections must use supported descriptor keys with raw `Uint8Array` bytes; every section must be referenced, references must be valid, and multibyte payload lengths must meet their type's alignment requirement.
+`encode(value, { operators: false })` expects an already prepared operator representation. For CRUD methods it reads each target object's local `binary` descriptors, removes them from structured JSON, converts local references to existing wire markers, preserves other operators, and builds the frame. It does not perform native JavaScript type conversion. The input is not mutated. Sections must use supported descriptor keys with raw `Uint8Array` bytes; every section must be referenced, and multibyte lengths must meet alignment requirements.
 
-The prepared binary path requires a non-array object root. Root arrays and root binary values can use the regular `operators: true` serialization and reconstruction path. Do not add literal strings in the reserved `"$binary[index]"` form to a prepared object: the encoder interprets a valid index as a binary reference and rejects invalid or unavailable indexes.
+CRUD references belong to each object in `object` (one object or an array). Non-CRUD messages continue to use the root as owner. Do not use canonical `binary[index]` strings as literal values in an owner containing binary metadata.
 
-An empty `$binary: []` is not treated as a binary section container by the current encoder and remains ordinary structured data. Do not use it as a prepared binary envelope.
+An empty `binary: []` is ordinary structured data; omit it when the owner has no binary sections.
 
 Disabling operator processing does not disable framing or all structured work. CoSON still inspects references, serializes JSON, and can generate reconstruction indexes. Frame construction allocates output storage and copies structured and binary bytes. No benchmark claims are made here for this mode.
 

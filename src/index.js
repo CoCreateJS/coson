@@ -459,6 +459,101 @@ function binaryReference(value) {
         : null;
 }
 
+function objectBinaryReference(value) {
+    if (typeof value !== "string")
+        return null;
+
+    const match = /^binary\[(0|[1-9]\d*)\]$/.exec(value);
+
+    return match && match[0] === value
+        ? Number(match[1])
+        : null;
+}
+
+const objectMethods = new Set([
+    "object.create",
+    "object.read",
+    "object.update",
+    "object.delete"
+]);
+
+function hasObjectScope(value) {
+    return Boolean(
+        value &&
+        typeof value === "object" &&
+        objectMethods.has(value.method)
+    );
+}
+
+function descriptorType(entry) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        return null;
+
+    const keys = Object.keys(entry);
+
+    if (keys.length !== 1 || !(entry[keys[0]] instanceof Uint8Array))
+        return null;
+
+    const key = keys[0];
+    const type = types.findIndex((Type, index) =>
+        Type && key === (
+            index === 14
+                ? "$Buffer"
+                : `$${Type.name}`
+        )
+    );
+
+    return type < 0
+        ? null
+        : { type, bytes: entry[key], alignment: types[type].BYTES_PER_ELEMENT || 1 };
+}
+
+function binaryDescriptors(owner) {
+    if (!Array.isArray(owner?.binary) || !owner.binary.length)
+        return null;
+
+    const descriptors = owner.binary.map(descriptorType);
+
+    return descriptors.every(Boolean)
+        ? descriptors
+        : null;
+}
+
+function nativeBinaryDescriptor(value) {
+    if (!value || typeof value !== "object")
+        return null;
+
+    const prototype = Object.getPrototypeOf(value);
+    let type = -1;
+    let bytes;
+
+    if (prototype === ArrayBuffer.prototype) {
+        type = 0;
+        bytes = new Uint8Array(value);
+    } else if (ArrayBuffer.isView(value)) {
+        type = types.findIndex((Type, index) =>
+            index > 0 && Type && prototype === Type.prototype
+        );
+
+        if (type >= 0) {
+            bytes = new Uint8Array(
+                value.buffer,
+                value.byteOffset,
+                value.byteLength
+            );
+        }
+    }
+
+    if (type < 0)
+        return null;
+
+    return {
+        type,
+        bytes,
+        alignment: types[type].BYTES_PER_ELEMENT || 1
+    };
+}
+
 function mapBinaryValues(value, replace, depth = 0) {
     if (depth > MAX_DEPTH)
         fail("maximum depth exceeded");
@@ -522,91 +617,250 @@ function mapBinaryValues(value, replace, depth = 0) {
  * other operator untouched.
  */
 
-function prepareBinary(value, state) {
-    if (
-        !value ||
-        typeof value !== "object" ||
-        Array.isArray(value) ||
-        !own(value, "$binary") ||
-        !Array.isArray(value.$binary) ||
-        !value.$binary.length
-    ) {
-        return value;
-    }
+function prepareObjectBinary(owner, state) {
+    if (!owner || typeof owner !== "object" || Array.isArray(owner))
+        return owner;
 
-    const { $binary: entries, ...structured } = value;
-    const typeIds = new Array(entries.length);
+    const descriptors = binaryDescriptors(owner);
+    const structured = { ...owner };
+    delete structured.binary;
+
+    const start = state.sections.length;
     const visited = new Set();
-
-    for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-
-        if (!entry || typeof entry !== "object" || Array.isArray(entry))
-            fail("invalid binary entry");
-
-        const keys = Object.keys(entry);
-
-        if (keys.length !== 1)
-            fail("invalid binary entry");
-
-        const type = types.findIndex((Type, index) =>
-            Type && keys[0] === (
-                index === 14
-                    ? "$Buffer"
-                    : `$${Type.name}`
-            )
-        );
-
-        if (type < 0)
-            fail("unsupported binary type");
-
-        const bytes = entry[keys[0]];
-        const alignment = types[type].BYTES_PER_ELEMENT || 1;
-
-        if (!(bytes instanceof Uint8Array))
-            fail("expected raw Uint8Array bytes");
-
-        if (
-            typeof SharedArrayBuffer !== "undefined" &&
-            bytes.buffer instanceof SharedArrayBuffer
-        ) {
-            fail("shared buffers are unsupported");
-        }
-
-        if (bytes.byteLength % alignment)
-            fail("invalid binary length");
-
-        typeIds[i] = type;
-
-        state.sections.push({
-            bytes,
-            alignment
-        });
-    }
+    let references = 0;
 
     const transformed = mapBinaryValues(structured, item => {
         if (operator(item) === "$binary")
-            fail("expected prepared binary reference");
+            fail("expected object-local binary reference");
 
-        const index = binaryReference(item);
+        const index = objectBinaryReference(item);
 
         if (index === null)
             return item;
 
-        if (!Number.isSafeInteger(index) || index >= entries.length)
-            fail("invalid binary reference");
+        if (!descriptors)
+            fail("missing object binary array");
+
+        if (!Number.isSafeInteger(index) || index >= descriptors.length)
+            fail("invalid object binary reference");
 
         visited.add(index);
+        references++;
 
         return {
-            $binary: [index, typeIds[index]]
+            $binary: [start + index, descriptors[index].type]
         };
     });
 
-    if (visited.size !== entries.length)
-        fail("unreferenced binary section");
+    if (!references)
+        return owner;
+
+    if (visited.size !== descriptors.length)
+        fail("unreferenced object binary section");
+
+    for (const descriptor of descriptors) {
+        if (
+            typeof SharedArrayBuffer !== "undefined" &&
+            descriptor.bytes.buffer instanceof SharedArrayBuffer
+        ) {
+            fail("shared buffers are unsupported");
+        }
+
+        if (descriptor.bytes.byteLength % descriptor.alignment)
+            fail("invalid binary length");
+
+        state.sections.push({
+            bytes: descriptor.bytes,
+            alignment: descriptor.alignment
+        });
+    }
 
     return transformed;
+}
+
+function prepareCRUDEnvelopeBinary(value, state) {
+    const target = value.object;
+    const owners = Array.isArray(target) ? target : [target];
+    const rawEntries = value.binary;
+    const descriptors = rawEntries.map(entry =>
+        descriptorType(entry) || nativeBinaryDescriptor(entry)
+    );
+    const referenced = new Set();
+    const byOwner = new Map();
+    let references = 0;
+    let changed = false;
+    const outputOwners = owners.slice();
+
+    for (let i = 0; i < owners.length; i++) {
+        const owner = owners[i];
+
+        if (!owner || typeof owner !== "object" || Array.isArray(owner))
+            continue;
+
+        const structured = { ...owner };
+        delete structured.binary;
+        let ownerReferences = 0;
+        const transformed = mapBinaryValues(structured, item => {
+            if (operator(item) === "$binary")
+                fail("expected prepared binary reference");
+
+            const index = objectBinaryReference(item);
+
+            if (index === null)
+                return item;
+
+            if (!Number.isSafeInteger(index) || index >= descriptors.length || !descriptors[index])
+                fail("invalid envelope binary reference");
+
+            const previousOwner = byOwner.get(index);
+            if (previousOwner !== undefined && previousOwner !== i)
+                fail("envelope binary section is shared between objects");
+
+            byOwner.set(index, i);
+            referenced.add(index);
+            ownerReferences++;
+            references++;
+
+            return { $binary: [index, descriptors[index].type] };
+        });
+
+        if (ownerReferences) {
+            if (own(owner, "binary"))
+                fail("object binary property conflict");
+
+            outputOwners[i] = transformed;
+            changed = true;
+        }
+    }
+
+    if (!references)
+        return null;
+
+    if (referenced.size !== descriptors.length)
+        fail("unreferenced envelope binary section");
+
+    for (const descriptor of descriptors) {
+        if (
+            typeof SharedArrayBuffer !== "undefined" &&
+            descriptor.bytes.buffer instanceof SharedArrayBuffer
+        ) {
+            fail("shared buffers are unsupported");
+        }
+
+        if (descriptor.bytes.byteLength % descriptor.alignment)
+            fail("invalid binary length");
+
+        state.sections.push({
+            bytes: descriptor.bytes,
+            alignment: descriptor.alignment
+        });
+    }
+
+    if (!changed)
+        return null;
+
+    const result = { ...value };
+    delete result.binary;
+    result.object = Array.isArray(target)
+        ? outputOwners
+        : outputOwners[0];
+    return result;
+}
+
+function prepareBinary(value, state) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return value;
+
+    // Non-CRUD messages retain the established root-owned `$binary` form.
+    if (!hasObjectScope(value) && own(value, "$binary") && Array.isArray(value.$binary) && value.$binary.length) {
+        const { $binary: entries, ...structured } = value;
+        const typeIds = new Array(entries.length);
+        const visited = new Set();
+
+        for (let i = 0; i < entries.length; i++) {
+            const descriptor = descriptorType(entries[i]);
+            if (!descriptor)
+                fail("invalid binary entry");
+            if (descriptor.bytes.byteLength % descriptor.alignment)
+                fail("invalid binary length");
+            typeIds[i] = descriptor.type;
+            state.sections.push({ bytes: descriptor.bytes, alignment: descriptor.alignment });
+        }
+
+        const transformed = mapBinaryValues(structured, item => {
+            if (objectBinaryReference(item) !== null)
+                fail("expected root binary reference");
+            const index = binaryReference(item);
+            if (index === null)
+                return item;
+            if (!Number.isSafeInteger(index) || index >= entries.length)
+                fail("invalid binary reference");
+            visited.add(index);
+            return { $binary: [index, typeIds[index]] };
+        });
+
+        if (visited.size !== entries.length)
+            fail("unreferenced binary section");
+
+        return transformed;
+    }
+
+    let output = value;
+
+    if (hasObjectScope(value)) {
+        if (Array.isArray(value.binary) && value.binary.length) {
+            const prepared = prepareCRUDEnvelopeBinary(value, state);
+
+            if (prepared) {
+                output = prepared;
+                const transformed = mapBinaryValues(output, item => {
+                    if (objectBinaryReference(item) !== null)
+                        fail("binary reference outside CRUD object scope");
+
+                    return item;
+                });
+
+                return transformed;
+            }
+        }
+
+        const target = value.object;
+
+        if (Array.isArray(target)) {
+            let objects;
+
+            for (let i = 0; i < target.length; i++) {
+                const transformed = prepareObjectBinary(target[i], state);
+
+                if (!Object.is(transformed, target[i])) {
+                    if (!objects)
+                        objects = target.slice();
+
+                    objects[i] = transformed;
+                }
+            }
+
+            if (objects) {
+                output = { ...value, object: objects };
+            }
+        } else {
+            const transformed = prepareObjectBinary(target, state);
+
+            if (!Object.is(transformed, target))
+                output = { ...value, object: transformed };
+        }
+
+        const transformed = mapBinaryValues(output, item => {
+            if (objectBinaryReference(item) !== null)
+                fail("binary reference outside CRUD object scope");
+
+            return item;
+        });
+
+        return transformed;
+    }
+
+    return prepareObjectBinary(value, state);
 }
 
 /*
@@ -859,10 +1113,12 @@ function frame(input) {
     }
 
     const sections = new Array(count);
+    const paddings = new Array(count);
 
     for (let i = 0; i < count; i++) {
         const length = uint();
         const padding = byte();
+        paddings[i] = padding;
 
         if (padding > 7)
             fail("invalid padding");
@@ -882,6 +1138,7 @@ function frame(input) {
         flags,
         structured,
         sections,
+        paddings,
         index
     };
 }
@@ -1186,19 +1443,103 @@ function applyIndex(value, entries, sections, binaryOnly) {
  *
  *     { $binary: [0, 2] }
  *
- * Into direct references:
+ * Into owner-local direct references:
  *
- *     "$binary[0]"
+ *     "binary[0]"
  *
- * And attaches the binary sections to the root:
+ * And attaches byte descriptors to each owner:
  *
- *     $binary: [
+ *     binary: [
  *         { $Uint8Array: bytes }
  *     ]
  *
- * The original message remains the root object.
+ * CRUD object scopes remain inside the original message envelope.
  * No native application values are reconstructed.
  */
+
+function preserveObjectBinary(value, sections, owner, ownerBySection) {
+    const entries = [];
+    const localByGlobal = new Map();
+    const visited = new Set();
+    let references = 0;
+    let transformed;
+
+    transformed = mapBinaryValues(value, item => {
+        // A binary reference belongs to exactly one object. Reusing a
+        // transport section across different owners is ambiguous.
+
+        if (
+            binaryReference(item) !== null ||
+            objectBinaryReference(item) !== null
+        )
+            fail("reserved binary reference string");
+
+        const key = operator(item);
+
+        if (key !== "$binary")
+            return item;
+
+        const argument = item.$binary;
+
+        if (!Array.isArray(argument) || argument.length !== 2)
+            fail("invalid binary operator");
+
+        const [index, type] = argument;
+
+        if (
+            !Number.isSafeInteger(index) ||
+            index < 0 ||
+            index >= sections.length ||
+            !Number.isInteger(type) ||
+            !types[type]
+        ) {
+            fail("invalid binary reference");
+        }
+
+        const claimedBy = ownerBySection.get(index);
+
+        if (claimedBy && claimedBy !== owner)
+            fail("binary section is shared between objects");
+
+        ownerBySection.set(index, owner);
+
+        let localIndex = localByGlobal.get(index);
+
+        if (localIndex === undefined) {
+            const bytes = sections[index];
+            const Type = types[type];
+            const alignment = Type.BYTES_PER_ELEMENT || 1;
+
+            if (
+                type !== 0 &&
+                type !== 12 &&
+                bytes.byteLength % alignment
+            ) {
+                fail("invalid binary length");
+            }
+
+            localIndex = entries.length;
+            localByGlobal.set(index, localIndex);
+            const name = type === 14 ? "Buffer" : Type.name;
+            entries.push({ [`$${name}`]: bytes });
+        } else {
+            const name = Object.keys(entries[localIndex])[0];
+            const expected = type === 14
+                ? "$Buffer"
+                : `$${types[type].name}`;
+
+            if (name !== expected)
+                fail("conflicting binary types");
+        }
+
+        visited.add(index);
+        references++;
+
+        return `binary[${localIndex}]`;
+    });
+
+    return { value: transformed, entries, visited, references };
+}
 
 function preserveBinary(value, sections) {
     if (!sections.length)
@@ -1213,94 +1554,75 @@ function preserveBinary(value, sections) {
         fail("binary envelope must be an object");
     }
 
-    if (own(value, "$binary"))
-        fail("binary envelope property conflict");
-
-    const entries = new Array(sections.length);
+    const ownerBySection = new Map();
+    const crud = hasObjectScope(value);
+    const target = crud ? value.object : value;
+    const owners = crud
+        ? (Array.isArray(target) ? target : [target])
+        : [value];
+    const ownerResults = new Map();
     const visited = new Set();
     let references = 0;
 
-    const transformed = mapBinaryValues(value, value => {
-        // Prevent literal reference-shaped strings from
-        // becoming ambiguous during subsequent encoding.
+    for (const owner of owners) {
+        if (!owner || typeof owner !== "object" || Array.isArray(owner))
+            continue;
 
-        if (binaryReference(value) !== null)
-            fail("reserved binary reference string");
+        const result = preserveObjectBinary(owner, sections, owner, ownerBySection);
 
-        const key = operator(value);
+        if (result.references) {
+            if (own(owner, "binary"))
+                fail("object binary property conflict");
 
-        if (key === "$binary") {
-            const argument = value.$binary;
+            define(result.value, "binary", result.entries);
+            ownerResults.set(owner, result.value);
+            references += result.references;
 
-            if (
-                !Array.isArray(argument) ||
-                argument.length !== 2
-            ) {
-                fail("invalid binary operator");
-            }
-
-            const [index, type] = argument;
-
-            if (
-                !Number.isSafeInteger(index) ||
-                index < 0 ||
-                index >= sections.length ||
-                !Number.isInteger(type) ||
-                !types[type]
-            ) {
-                fail("invalid binary reference");
-            }
-
-            const bytes = sections[index];
-            const Type = types[type];
-            const alignment = Type.BYTES_PER_ELEMENT || 1;
-
-            if (
-                type !== 0 &&
-                type !== 12 &&
-                bytes.byteLength % alignment
-            ) {
-                fail("invalid binary length");
-            }
-
-            if (!entries[index]) {
-                const name = type === 14
-                    ? "Buffer"
-                    : Type.name;
-
-                entries[index] = {
-                    [`$${name}`]: bytes
-                };
-            } else {
-                const name = Object.keys(entries[index])[0];
-
-                const expected = type === 14
-                    ? "$Buffer"
-                    : `$${Type.name}`;
-
-                if (name !== expected)
-                    fail("conflicting binary types");
-            }
-
-            visited.add(index);
-            references++;
-
-            return `$binary[${index}]`;
+            for (const index of result.visited)
+                visited.add(index);
         }
-
-        return value;
-    });
-
-    if (
-        !references ||
-        visited.size !== sections.length
-    ) {
-        fail("unreferenced binary section");
     }
 
-    define(transformed, "$binary", entries);
+    if (!references || visited.size !== sections.length)
+        fail("unreferenced or unowned binary section");
 
-    return transformed;
+    let transformed = value;
+
+    if (crud) {
+        if (Array.isArray(target)) {
+            const output = target.slice();
+            let changed = false;
+
+            for (let i = 0; i < target.length; i++) {
+                const result = ownerResults.get(target[i]);
+
+                if (result) {
+                    output[i] = result;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+                transformed = { ...value, object: output };
+        } else {
+            const result = ownerResults.get(target);
+
+            if (result)
+                transformed = { ...value, object: result };
+        }
+
+        transformed = mapBinaryValues(transformed, item => {
+            if (operator(item) === "$binary")
+                fail("binary value outside CRUD object scope");
+            return item;
+        });
+
+        return transformed;
+    }
+
+    const result = ownerResults.get(value);
+
+    return result || transformed;
 }
 
 /*
@@ -1322,10 +1644,14 @@ function preserveBinary(value, sections) {
  */
 
 export function decode(bytes, options) {
+    return decodeParts(frame(bytes), options);
+}
+
+function decodeParts({ flags, structured, sections, index }, options) {
     const mode =
         options?.operators ??
         options?.reconstruct ??
-        true;
+        false;
 
     if (
         mode !== true &&
@@ -1334,13 +1660,6 @@ export function decode(bytes, options) {
     ) {
         fail("invalid operators mode");
     }
-
-    const {
-        flags,
-        structured,
-        sections,
-        index
-    } = frame(bytes);
 
     const value = JSON.parse(
         decoder.decode(structured)
@@ -1395,4 +1714,53 @@ export function decode(bytes, options) {
     // Full recursive reconstruction fallback.
 
     return reconstruct(value, sections);
+}
+
+/** Encode CoSON as readable structured JSON plus independently transferable binary sections. */
+export function encodeSegments(value, options) {
+    const state = { flags: 0, sections: [], seen: new WeakSet() };
+    const mode = options?.operators ?? true;
+    if (mode !== true && mode !== false) fail("invalid operators mode");
+    const transformed = mode ? transform(value, state) : prepareBinary(value, state);
+    let entries;
+    if (!mode) {
+        entries = collectIndex(transformed);
+        if (entries[0].length) state.flags |= OPERATORS;
+        if (entries[1].length && !state.sections.length) fail("missing binary sections");
+    }
+    const index = state.flags && options?.index !== false
+        ? encoder.encode(JSON.stringify(entries || collectIndex(transformed)))
+        : null;
+    if (index) state.flags |= INDEX;
+    const json = JSON.stringify(transformed);
+    return {
+        json,
+        flags: state.flags,
+        index,
+        binaries: state.sections.map(section => new Uint8Array(
+            section.bytes.buffer, section.bytes.byteOffset, section.bytes.byteLength
+        ))
+    };
+}
+
+function toCoSONBytes(value) {
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    fail("CoSON segment must be binary");
+}
+
+/** Reassemble segmented CoSON bytes and decode using the standard operator policy. */
+export function decodeSegments(segments, options) {
+    if (!segments || typeof segments.json !== "string" || !Array.isArray(segments.binaries))
+        fail("invalid CoSON segments");
+    const index = segments.index == null ? null : toCoSONBytes(segments.index);
+    const sections = segments.binaries.map(value => {
+        const bytes = toCoSONBytes(value);
+        return bytes.byteOffset % 8 ? new Uint8Array(bytes) : bytes;
+    });
+    const flags = segments.flags;
+    if (!Number.isInteger(flags) || flags < 0 || flags > 3 || Boolean(flags & INDEX) !== Boolean(index))
+        fail("invalid CoSON segment flags");
+    return decodeParts({ flags, structured: encoder.encode(segments.json), sections, index }, options);
 }

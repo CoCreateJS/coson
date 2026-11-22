@@ -436,13 +436,13 @@ This converts native JavaScript values into CoSON operators, extracts raw binary
 
     encode(value, { operators: false })
 
-This accepts a prepared operator representation. It preserves non-binary operators, extracts bytes from a non-empty root `$binary` descriptor array, replaces canonical direct binary references with the wire-level `$binary` operator, and constructs the frame. It does not run native-value conversion.
+This accepts a prepared operator representation. For CRUD methods (`object.create`, `object.read`, `object.update`, and `object.delete`), it reads descriptors from each target object, extracts raw bytes, replaces object-local references with the existing wire-level `$binary` operator, and constructs the frame. It does not run native-value conversion. Non-CRUD messages retain root-owned binary metadata.
 
 When `operators` is false, each descriptor must be a one-key object using a registered binary descriptor key; its value must be a `Uint8Array` containing raw bytes. All sections must be referenced. References must identify an existing section, and section byte lengths must satisfy type alignment. SharedArrayBuffer-backed bytes are rejected.
 
-The prepared root `$binary` array is transport metadata and is omitted from the structured JSON when it contains sections. An empty `$binary` array is not treated as a binary container by the current encoder and remains ordinary structured data.
+Each CRUD object's `binary` array is transport metadata and is omitted from structured JSON when it contains sections. An empty `binary` array remains ordinary structured data.
 
-The decoded prepared reference syntax is the literal string `$binary[index]`, where `index` is canonical non-negative decimal notation (`0` or a nonzero digit followed by decimal digits). It identifies the entry at that index in the root `$binary` array. This syntax is reserved in prepared envelopes and is not an executable expression.
+The decoded CRUD reference syntax is the literal string `binary[index]`, where `index` is canonical non-negative decimal notation. It identifies an entry in the current object's `binary` array. Each owner starts indexing at zero. The syntax is reserved in binary-bearing owners and is not executable.
 
 The operation does not mutate the input. It still inspects reference positions, serializes structured JSON, creates frame storage and copies structured and binary bytes into the frame.
 
@@ -473,49 +473,51 @@ With native reconstruction enabled, if the payload contains no extended type ope
 
     decode(payload, options)
 
-`options.operators` defaults to `true`.
+`options.operators` defaults to `false`.
 
 | `operators` | Behavior |
 |---|---|
-| `true` or omitted | Reconstruct all supported native values. |
-| `false` | Preserve operators; replace binary wire operators with direct string references and attach typed raw-byte descriptors to the root when sections exist. |
+| `true` | Reconstruct all supported native values. |
+| `false` or omitted | Preserve operators; replace binary wire operators with direct string references and attach typed raw-byte descriptors to each owning CRUD object when sections exist. |
 | `"binary"` | Reconstruct binary values and preserve non-binary operators. Decode only. |
 
 The earlier `reconstruct` option remains supported for backward compatibility. A non-nullish `operators` option takes precedence over `reconstruct`; if it is omitted or nullish, the legacy option is consulted. The reconstruction index remains independent of this choice. Indexed and unindexed frames remain supported; unindexed full reconstruction uses recursive fallback, while unindexed binary-only reconstruction collects binary paths.
 
 ### 9.2 Operator-preserving decoded representation
 
-The wire-level binary operator remains `{ "$binary": [sectionIndex, typeIdentifier] }`. With `operators: false`, decoding parses the structured JSON and traverses it to replace each binary wire operator with a direct reference string `"$binary[index]"`. Other operators, such as `$date`, remain in the structured representation. The decoder attaches a `$binary` array to the original root object; each entry is a one-key type descriptor containing a `Uint8Array` view over the corresponding raw section bytes. For example:
+The wire-level binary operator remains `{ "$binary": [sectionIndex, typeIdentifier] }`. With `operators: false`, decoding parses the structured JSON and traverses it to replace each binary wire operator with `binary[index]` within its owning CRUD object. Other operators, such as `$date`, remain in the structured representation. Each owning object receives its own `binary` array of one-key descriptors containing views over corresponding raw section bytes. For example:
 
     {
-        "method": "upload",
+        "method": "object.create",
         "created": { "$date": 1767225600000 },
-        "image": "$binary[0]",
-        "pixels": "$binary[1]",
-        "$binary": [
-            { "$Uint8Array": bytes0 },
-            { "$Uint16Array": bytes1 }
-        ]
+        "object": [{
+            "image": "binary[0]",
+            "pixels": "binary[1]",
+            "binary": [
+                { "$Uint8Array": bytes0 },
+                { "$Uint16Array": bytes1 }
+            ]
+        }]
     }
 
-Descriptor keys correspond to the binary type identifiers in Section 6.1, including `$Buffer` for type 14. Descriptor values remain byte views; the original type is represented by the key and no native typed-array instance is reconstructed in this mode. Views share and retain the frame's backing memory. The reference string resolves by index into this root array; it is not an executable operator.
+Descriptor keys correspond to the binary type identifiers in Section 6.1, including `$Buffer` for type 14. Descriptor values remain byte views; the original type is represented by the key and no native typed-array instance is reconstructed in this mode. Views share and retain the frame's backing memory. Indexes are local to their owner, not global across the envelope.
 
-This is an in-memory decoded representation, not a change to the wire format. The conversion traverses the parsed structure and allocates reference strings and descriptor containers; it does not copy the section bytes. The traversal discovers references in the parsed value and does not use the reconstruction index. Every section must be referenced, indexes and type identifiers must be valid, and conflicting types for a section are rejected. Canonical strings matching `"$binary[index]"` are reserved in this mode and cause decoding to fail, preventing ambiguous literal strings in the prepared representation; automatic escaping is not implemented.
+This is an in-memory decoded representation, not a change to the wire format. The conversion traverses the parsed structure and allocates reference strings and descriptor containers; it does not copy the section bytes. The traversal discovers references in the parsed value and does not use the reconstruction index. Every section must be referenced by exactly one owner, indexes and type identifiers must be valid, and conflicting types for a section are rejected. Canonical strings matching `binary[index]` are reserved in binary-bearing owners; automatic escaping is not implemented.
 
-If sections exist, the parsed root must be a non-array object, must not itself be an operator, and must not have its own `$binary` property; otherwise decoding throws `TypeError`. With no sections, the parsed value is returned unchanged. The root `$binary` property is reserved for transport metadata. Applications resolving these references must validate their syntax and index; neither CoSON nor an external consumer should evaluate reference strings as code.
+For CRUD methods, each owner must be an object and its `binary` property is reserved for transport metadata. A section cannot be shared across owners. Non-CRUD messages retain root ownership. With no sections, the parsed value is returned unchanged. Applications resolving references must validate their syntax and index; reference strings must never be evaluated as code.
 
 Example:
 
     const parsed = decode(payload, { operators: false });
-    const imageBytes = parsed.$binary[0].$Uint8Array;
+    const imageBytes = parsed.object[0].binary[0].$Uint8Array;
 
 ### 9.3 Re-encoding a prepared representation
 
-`encode(prepared, { operators: false })` is the inverse transport operation for a prepared representation with a non-empty root `$binary` array. It validates the descriptor entries, extracts their raw bytes, removes the root metadata from the structured section, converts each exact `"$binary[index]"` reference into the existing wire operator with the associated type identifier, preserves non-binary operators, generates an index when enabled, and builds a normal CoSON frame. No native application values are reconstructed or converted. The input object is not mutated.
+`encode(prepared, { operators: false })` reassembles object-local prepared representations into a normal CoSON frame. It validates descriptors, extracts their raw bytes, removes local metadata from structured JSON, converts exact `binary[index]` references into the existing wire operator, preserves non-binary operators, and generates an index when enabled. No native application values are reconstructed or converted. The input is not mutated.
 
 All descriptor sections must be referenced. A reference must use canonical decimal syntax, identify an available section, and be unambiguous; unreferenced entries and invalid references are rejected. Only registered type descriptor keys and raw `Uint8Array` bytes are accepted. Typed-array alignment constraints are checked. A prepared object that is changed must be re-indexed from its current contents; previously generated paths are not reused. With no sections, the decoded operator representation can be encoded with `operators: false` as structured operator data, subject to normal validation.
 
-The binary-preserving path requires a non-array ordinary root object when sections are present. Root arrays and root binary values remain supported by the standard `operators: true` path, not by the prepared binary-envelope path.
+CRUD scope accepts one target object or an array of target objects. Each retains independent local references. Existing prepared objects can be reassembled repeatedly; mutations must keep every reference and descriptor aligned. Stale or unreferenced sections are rejected rather than silently reassigned.
 
 These operator-processing modes reuse the current frame magic, version, flags, length encoding, structured JSON encoding, binary-section layout, type identifiers, alignment, and reconstruction-index format. They do not introduce a wire-format version or alter the wire-level binary marker.
 
